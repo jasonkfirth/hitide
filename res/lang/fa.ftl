@@ -255,3 +255,4 @@ view_more_comments = دیدگاه‌های بیشتری را نمایش بده
 your_note = یادداشت شخصی
 your_note_add = اضافه کردن یادداشت شخصی
 your_note_edit = ویرایش یادداشت شخصی
+notification_user_follow = { $user } followed you.

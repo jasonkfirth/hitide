@@ -1,3 +1,4 @@
+use crate::hyper;
 use render::Render;
 use serde_derive::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -5,17 +6,20 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::sync::Arc;
 
+use crate::PageBaseData;
 use crate::components::{
-    BoolCheckbox, ContentView, FlagItem, HTPage, MaybeFillInput, NotificationItem, PostItem,
-    SiteModlogEventItem, ThingItem,
+    BoolCheckbox, ContentView, FlagItem, FollowFederationStatusBadge, HTPage, MaybeFillInput,
+    NotificationItem, PostItem, SiteModlogEventItem, ThingItem, UserAvatar,
+    federation_status_line_class,
 };
 use crate::lang;
 use crate::query_types::{FlagListQuery, PostListQuery};
 use crate::resp_types::{
-    InvitationsCreateResponse, JustStringID, RespFlagInfo, RespInstanceInfo, RespInvitationInfo,
-    RespList, RespNotification, RespPostListPost, RespSiteModlogEvent, RespThingInfo, RespUserInfo,
+    InvitationsCreateResponse, JustStringID, RespCollectionTargetInfo, RespFlagInfo,
+    RespInstanceInfo, RespInvitationInfo, RespList, RespNotification, RespPostListPost,
+    RespSiteModlogEvent, RespThingInfo, RespUserInfo,
 };
-use crate::PageBaseData;
+use crate::util::safe_href;
 
 mod administration;
 mod comments;
@@ -39,23 +43,59 @@ struct SignupQuery<'a> {
 
 type CookieMap<'a> = std::collections::HashMap<&'a str, ginger::Cookie<'a>>;
 
-fn get_cookie_map(src: Option<&str>) -> Result<CookieMap, ginger::ParseError> {
-    use fallible_iterator::FallibleIterator;
+fn get_cookie_map(src: Option<&str>) -> Result<CookieMap<'_>, ginger::ParseError> {
+    let mut cookies = HashMap::new();
 
-    src.map(|s| {
-        fallible_iterator::convert(ginger::parse_cookies(s))
-            .map(|cookie| Ok((cookie.name, cookie)))
-            .collect()
-    })
-    .unwrap_or_else(|| Ok(Default::default()))
+    if let Some(src) = src {
+        /*
+            Some clients and proxies append non-cookie tokens to the Cookie
+            header. A bad fragment must not make the whole page fail; valid
+            cookies in the same header are still usable.
+        */
+        for cookie in ginger::parse_cookies(src) {
+            match cookie {
+                Ok(cookie) if !cookie.name.is_empty() => {
+                    cookies.insert(cookie.name, cookie);
+                }
+                Ok(_) | Err(ginger::ParseError::NoEquals) => {}
+            }
+        }
+    }
+
+    Ok(cookies)
 }
 
-fn get_cookie_map_for_req(req: &hyper::Request<hyper::Body>) -> Result<CookieMap, crate::Error> {
+fn get_cookie_map_for_req(
+    req: &hyper::Request<hyper::Body>,
+) -> Result<CookieMap<'_>, crate::Error> {
     get_cookie_map_for_headers(req.headers())
 }
 
-fn get_cookie_map_for_headers(headers: &hyper::HeaderMap) -> Result<CookieMap, crate::Error> {
+fn get_cookie_map_for_headers(headers: &hyper::HeaderMap) -> Result<CookieMap<'_>, crate::Error> {
     get_cookie_map(get_cookies_string(headers)?).map_err(Into::into)
+}
+
+fn home_posts_query(page: Option<&str>) -> PostListQuery<'_> {
+    PostListQuery {
+        in_your_follows: Some(true),
+        include_your: Some(true),
+        sort: Some(crate::SortType::New.as_str()),
+        page,
+        ..Default::default()
+    }
+}
+
+fn aggregate_posts_query(
+    page: Option<&str>,
+    in_any_local_community: Option<bool>,
+) -> PostListQuery<'_> {
+    PostListQuery {
+        use_aggregate_filters: Some(true),
+        in_any_local_community,
+        sort: Some(crate::SortType::New.as_str()),
+        page,
+        ..Default::default()
+    }
 }
 
 fn get_cookies_string(headers: &hyper::HeaderMap) -> Result<Option<&str>, crate::Error> {
@@ -74,7 +114,7 @@ fn for_client(
     if let Some(token) = token {
         new_req.headers_mut().insert(
             hyper::header::AUTHORIZATION,
-            hyper::header::HeaderValue::from_str(&format!("Bearer {}", token))?,
+            hyper::header::HeaderValue::from_str(&format!("Bearer {token}"))?,
         );
     }
     if let Some(value) = src_headers.get(hyper::header::ACCEPT_LANGUAGE) {
@@ -95,7 +135,7 @@ async fn fetch_base_data(
     let login = {
         let api_res = http_client
             .request(for_client(
-                hyper::Request::get(format!("{}/api/unstable/logins/~current", backend_host))
+                hyper::Request::get(format!("{backend_host}/api/unstable/logins/~current"))
                     .body(Default::default())?,
                 headers,
                 cookies,
@@ -106,12 +146,31 @@ async fn fetch_base_data(
             Ok(None)
         } else {
             let api_res = res_to_error(api_res).await?;
-            let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+            let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
             serde_json::from_slice(&api_res)
         }
     }?;
 
-    Ok(PageBaseData { login })
+    let instance_info = res_to_error(
+        http_client
+            .request(for_client(
+                hyper::Request::get(format!("{backend_host}/api/unstable/instance"))
+                    .body(Default::default())?,
+                headers,
+                cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+    let instance_info = crate::read_body_with_timeout(instance_info.into_body()).await?;
+    let instance_info: RespInstanceInfo = serde_json::from_slice(&instance_info)?;
+
+    Ok(PageBaseData {
+        login,
+        site_name: instance_info.site_name.into_owned(),
+        site_logo_url: instance_info.site_logo.map(|logo| logo.url.into_owned()),
+        site_css_url: instance_info.site_css.map(|css| css.url.into_owned()),
+    })
 }
 
 fn html_response(html: String) -> hyper::Response<hyper::Body> {
@@ -123,12 +182,69 @@ fn html_response(html: String) -> hyper::Response<hyper::Body> {
     res
 }
 
+fn uncached_html_response(html: String) -> hyper::Response<hyper::Body> {
+    /*
+        Discussion pages change under a stable URL whenever replies, votes, or
+        moderation state changes. The reverse proxy may otherwise serve a page
+        that was correct a few seconds ago but is now missing a just-created
+        local comment.
+    */
+    let mut res = html_response(html);
+    res.headers_mut().insert(
+        hyper::header::CACHE_CONTROL,
+        hyper::header::HeaderValue::from_static(
+            "no-store, no-cache, must-revalidate, max-age=0, private",
+        ),
+    );
+    res.headers_mut().insert(
+        hyper::header::PRAGMA,
+        hyper::header::HeaderValue::from_static("no-cache"),
+    );
+    res.headers_mut().insert(
+        hyper::header::EXPIRES,
+        hyper::header::HeaderValue::from_static("0"),
+    );
+    res.headers_mut().insert(
+        "Surrogate-Control",
+        hyper::header::HeaderValue::from_static("no-store"),
+    );
+    res
+}
+
+fn cache_invalidating_response(
+    mut res: hyper::Response<hyper::Body>,
+) -> hyper::Response<hyper::Body> {
+    res.headers_mut().insert(
+        hyper::header::CACHE_CONTROL,
+        hyper::header::HeaderValue::from_static(
+            "no-store, no-cache, must-revalidate, max-age=0, private",
+        ),
+    );
+    res.headers_mut().insert(
+        hyper::header::PRAGMA,
+        hyper::header::HeaderValue::from_static("no-cache"),
+    );
+    res.headers_mut().insert(
+        hyper::header::EXPIRES,
+        hyper::header::HeaderValue::from_static("0"),
+    );
+    res.headers_mut().insert(
+        "Clear-Site-Data",
+        hyper::header::HeaderValue::from_static("\"cache\""),
+    );
+    res.headers_mut().insert(
+        "Surrogate-Control",
+        hyper::header::HeaderValue::from_static("no-store"),
+    );
+    res
+}
+
 pub fn default_comments_sort() -> crate::SortType {
     crate::SortType::Hot
 }
 
 async fn page_about(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -148,7 +264,7 @@ async fn page_about(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let api_res: RespInstanceInfo = serde_json::from_slice(&api_res)?;
 
     let title = lang.tr(&lang::ABOUT_TITLE);
@@ -207,7 +323,7 @@ async fn page_about(
 }
 
 async fn page_login(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -289,7 +405,7 @@ pub async fn res_to_error(
     if status.is_success() {
         Ok(res)
     } else {
-        let bytes = hyper::body::to_bytes(res.into_body()).await?;
+        let bytes = crate::read_body_with_timeout(res.into_body()).await?;
         Err(crate::Error::RemoteError((
             status,
             String::from_utf8_lossy(&bytes).into_owned(),
@@ -298,7 +414,7 @@ pub async fn res_to_error(
 }
 
 async fn handler_login_submit(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -309,7 +425,7 @@ async fn handler_login_submit(
 
     let (req_parts, body) = req.into_parts();
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let body: serde_json::Value = serde_urlencoded::from_bytes(&body)?;
 
     let api_res = res_to_error(
@@ -324,19 +440,21 @@ async fn handler_login_submit(
 
     match api_res {
         Ok(api_res) => {
-            let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+            let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
             let api_res: LoginsCreateResponse = serde_json::from_slice(&api_res)?;
 
             let token = api_res.token;
 
-            Ok(hyper::Response::builder()
-                .status(hyper::StatusCode::SEE_OTHER)
-                .header(
-                    hyper::header::SET_COOKIE,
-                    format!("hitideToken={}; Path=/; Max-Age={}", token, COOKIE_AGE),
-                )
-                .header(hyper::header::LOCATION, "/")
-                .body("Successfully logged in.".into())?)
+            Ok(cache_invalidating_response(
+                hyper::Response::builder()
+                    .status(hyper::StatusCode::SEE_OTHER)
+                    .header(
+                        hyper::header::SET_COOKIE,
+                        format!("hitideToken={token}; Path=/; Max-Age={COOKIE_AGE}"),
+                    )
+                    .header(hyper::header::LOCATION, "/")
+                    .body("Successfully logged in.".into())?,
+            ))
         }
         Err(crate::Error::RemoteError((status, message))) if status.is_client_error() => {
             page_login_inner(ctx, req_parts, Some(message), Some(&body)).await
@@ -346,7 +464,7 @@ async fn handler_login_submit(
 }
 
 async fn handler_logout(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -378,7 +496,7 @@ async fn handler_logout(
 }
 
 async fn page_lookup(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -397,7 +515,8 @@ async fn page_lookup(
 
     #[derive(Deserialize)]
     #[serde(rename_all = "snake_case")]
-    enum ActorType {
+    enum LookupType {
+        CollectionTarget,
         Community,
         User,
         #[serde(other)]
@@ -408,11 +527,11 @@ async fn page_lookup(
     struct LookupResult {
         id: i64,
         #[serde(rename = "type")]
-        kind: ActorType,
+        kind: LookupType,
     }
 
     let api_res: Option<Result<Vec<LookupResult>, String>> = if let Some(query) = &query {
-        let api_res = res_to_error(
+        let actor_res = res_to_error(
             ctx.http_client
                 .request(
                     hyper::Request::get(format!(
@@ -426,16 +545,48 @@ async fn page_lookup(
         )
         .await;
 
-        Some(match api_res {
+        let actor_res = match actor_res {
             Ok(api_res) => {
-                let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
-                Ok(serde_json::from_slice(&api_res)?)
+                let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
+                Ok(serde_json::from_slice::<Vec<LookupResult>>(&api_res)?)
             }
             Err(crate::Error::RemoteError((status, message))) if status.is_client_error() => {
                 Err(message)
             }
             Err(other) => return Err(other),
-        })
+        };
+
+        match actor_res {
+            Ok(items) if !items.is_empty() => Some(Ok(items)),
+            actor_res => {
+                let object_res = res_to_error(
+                    ctx.http_client
+                        .request(
+                            hyper::Request::get(format!(
+                                "{}/api/unstable/objects:lookup/{}",
+                                ctx.backend_host,
+                                urlencoding::encode(query)
+                            ))
+                            .body(Default::default())?,
+                        )
+                        .await?,
+                )
+                .await;
+
+                Some(match object_res {
+                    Ok(api_res) => {
+                        let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
+                        Ok(serde_json::from_slice::<Vec<LookupResult>>(&api_res)?)
+                    }
+                    Err(crate::Error::RemoteError((status, message)))
+                        if status.is_client_error() =>
+                    {
+                        actor_res.and(Err(message))
+                    }
+                    Err(other) => return Err(other),
+                })
+            }
+        }
     } else {
         None
     };
@@ -444,11 +595,12 @@ async fn page_lookup(
         Some(Ok(items)) if !items.is_empty() => {
             let item = &items[0];
             let dest = match item.kind {
-                ActorType::Community => format!("/communities/{}", item.id),
-                ActorType::User => format!("/users/{}", item.id),
-                ActorType::Unknown => {
+                LookupType::CollectionTarget => format!("/collection_targets/{}", item.id),
+                LookupType::Community => format!("/communities/{}", item.id),
+                LookupType::User => format!("/users/{}", item.id),
+                LookupType::Unknown => {
                     return Err(crate::Error::InternalStr(
-                        "Unknown actor type received from lookup".to_owned(),
+                        "Unknown object type received from lookup".to_owned(),
                     ));
                 }
             };
@@ -485,8 +637,228 @@ async fn page_lookup(
     }
 }
 
+async fn page_collection_target(
+    params: (i64,),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (collection_target_id,) = params;
+    let lang = crate::get_lang_for_req(&req);
+    let cookies = get_cookie_map_for_req(&req)?;
+    let base_data =
+        fetch_base_data(&ctx.backend_host, &ctx.http_client, req.headers(), &cookies).await?;
+
+    let api_res = res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::get(format!(
+                    "{}/api/unstable/collection_targets/{}",
+                    ctx.backend_host, collection_target_id,
+                ))
+                .body(Default::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
+    let collection: RespCollectionTargetInfo = serde_json::from_slice(&api_res)?;
+
+    let title = collection.name.as_ref();
+    let follow_status = collection
+        .your_follow
+        .as_ref()
+        .map_or(collection.latest_unfollow_status, |follow| {
+            follow.federation_status
+        });
+    let follow_class = format!(
+        "followAction {}",
+        federation_status_line_class(follow_status),
+    );
+    let preview_rows = collection
+        .preview_items
+        .iter()
+        .map(|item| {
+            let href = item
+                .url
+                .as_ref()
+                .map_or_else(|| item.ap_id.as_ref(), std::convert::AsRef::as_ref);
+            render::rsx! {
+                <li>
+                    <a href={safe_href(href).unwrap_or("#")}>{item.name.as_ref()}</a>
+                    {
+                        item.kind.as_ref().map(|kind| {
+                            render::rsx! {
+                                <>
+                                    {" "}
+                                    <span class={"metaText"}>{kind.as_ref()}</span>
+                                </>
+                            }
+                        })
+                    }
+                    {
+                        item.published.as_ref().map(|published| {
+                            render::rsx! {
+                                <>
+                                    {" "}
+                                    <span class={"metaText"}>{published.as_ref()}</span>
+                                </>
+                            }
+                        })
+                    }
+                </li>
+            }
+        })
+        .collect::<Vec<_>>();
+    let preview_section = if preview_rows.is_empty() {
+        None
+    } else {
+        Some(render::rsx! {
+            <section>
+                <h2>{"Preview"}</h2>
+                <ul class={"collectionPreviewList"}>{preview_rows}</ul>
+            </section>
+        })
+    };
+
+    Ok(html_response(render::html! {
+        <HTPage base_data={&base_data} lang={&lang} title>
+            <h1>{title}</h1>
+            <p>
+                <em>{collection.software.as_deref().unwrap_or_else(|| collection.kind.as_ref())}</em>
+                {" "}
+                <a href={safe_href(collection.remote_url.as_ref()).unwrap_or("#")}>{lang.tr(&lang::VIEW_AT_SOURCE)}{" ↗"}</a>
+            </p>
+            {
+                collection.total_items.map(|total_items| {
+                    render::rsx! {
+                        <p>{format!("{} items", total_items)}</p>
+                    }
+                })
+            }
+            {
+                collection.summary_html.as_ref().map(|summary| {
+                    render::rsx! {
+                        <div class={"infoBox"}>{summary.as_ref()}</div>
+                    }
+                })
+            }
+            {preview_section}
+            {
+                if base_data.login.is_some() {
+                    Some(render::rsx! {
+                        <p class={follow_class}>
+                            {
+                                match collection.your_follow.as_ref() {
+                                    Some(crate::resp_types::RespYourFollow { accepted: true, .. }) => {
+                                        render::rsx! {
+                                            <form method={"POST"} action={format!("/collection_targets/{}/unfollow", collection_target_id)}>
+                                                <button type={"submit"}>{lang.tr(&lang::FOLLOW_UNDO)}</button>
+                                            </form>
+                                        }
+                                    }
+                                    Some(crate::resp_types::RespYourFollow { accepted: false, .. }) => {
+                                        render::rsx! {
+                                            <form method={"POST"} action={format!("/collection_targets/{}/unfollow", collection_target_id)}>
+                                                <button type={"submit"}>{lang.tr(&lang::FOLLOW_REQUEST_CANCEL)}</button>
+                                            </form>
+                                        }
+                                    }
+                                    None => {
+                                        render::rsx! {
+                                            <form method={"POST"} action={format!("/collection_targets/{}/follow", collection_target_id)}>
+                                                <button type={"submit"}>{lang.tr(&lang::FOLLOW)}</button>
+                                            </form>
+                                        }
+                                    }
+                                }
+                            }
+                            <FollowFederationStatusBadge
+                                your_follow={collection.your_follow.as_ref()}
+                                latest_unfollow_status={collection.latest_unfollow_status}
+                            />
+                        </p>
+                    })
+                } else {
+                    None
+                }
+            }
+        </HTPage>
+    }))
+}
+
+async fn handler_collection_target_follow(
+    params: (i64,),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (collection_target_id,) = params;
+    let cookies = get_cookie_map_for_req(&req)?;
+
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::post(format!(
+                    "{}/api/unstable/collection_targets/{}/follow",
+                    ctx.backend_host, collection_target_id
+                ))
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body("{\"try_wait_for_accept\":false}".into())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+
+    Ok(cache_invalidating_response(
+        hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(
+                hyper::header::LOCATION,
+                format!("/collection_targets/{collection_target_id}"),
+            )
+            .body("Successfully followed".into())?,
+    ))
+}
+
+async fn handler_collection_target_unfollow(
+    params: (i64,),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (collection_target_id,) = params;
+    let cookies = get_cookie_map_for_req(&req)?;
+
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::post(format!(
+                    "{}/api/unstable/collection_targets/{}/unfollow",
+                    ctx.backend_host, collection_target_id
+                ))
+                .body(Default::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+
+    Ok(cache_invalidating_response(
+        hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(
+                hyper::header::LOCATION,
+                format!("/collection_targets/{collection_target_id}"),
+            )
+            .body("Successfully unfollowed".into())?,
+    ))
+}
+
 async fn page_modlog(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -510,7 +882,7 @@ async fn page_modlog(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let api_res: RespList<RespSiteModlogEvent> = serde_json::from_slice(&api_res)?;
 
     let title = lang.tr(&lang::MODLOG_SITE);
@@ -533,7 +905,7 @@ async fn page_modlog(
 }
 
 async fn page_my_invitations(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -550,7 +922,7 @@ async fn page_my_invitations_inner(
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
     let lang = crate::get_lang_for_headers(headers);
 
-    let base_data = fetch_base_data(&ctx.backend_host, &ctx.http_client, headers, &cookies).await?;
+    let base_data = fetch_base_data(&ctx.backend_host, &ctx.http_client, headers, cookies).await?;
 
     let can_create_result = match &base_data.login {
         None => Err(lang.tr(&lang::MUST_LOGIN)),
@@ -615,7 +987,7 @@ async fn page_my_invitations_inner(
 }
 
 async fn handler_my_invitations_create(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -626,7 +998,7 @@ async fn handler_my_invitations_create(
             .request(for_client(
                 hyper::Request::post(format!("{}/api/unstable/invitations", ctx.backend_host))
                     .body(Default::default())?,
-                &req.headers(),
+                req.headers(),
                 &cookies,
             )?)
             .await?,
@@ -635,7 +1007,7 @@ async fn handler_my_invitations_create(
 
     match api_res {
         Ok(api_res) => {
-            let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+            let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
             let api_res: InvitationsCreateResponse = serde_json::from_slice(&api_res)?;
 
             page_my_invitations_inner(ctx, req.headers(), &cookies, Some(Ok(api_res))).await
@@ -648,7 +1020,7 @@ async fn handler_my_invitations_create(
 }
 
 async fn page_new_community(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -716,7 +1088,7 @@ async fn page_new_community_inner(
 }
 
 async fn handler_new_community_submit(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -724,7 +1096,7 @@ async fn handler_new_community_submit(
 
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let body: serde_json::Value = serde_urlencoded::from_bytes(&body)?;
 
     #[derive(Deserialize)]
@@ -751,7 +1123,7 @@ async fn handler_new_community_submit(
 
     match api_res {
         Ok(api_res) => {
-            let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+            let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
             let api_res: CommunitiesCreateResponse = serde_json::from_slice(&api_res)?;
 
             let community_id = api_res.community.id;
@@ -760,7 +1132,7 @@ async fn handler_new_community_submit(
                 .status(hyper::StatusCode::SEE_OTHER)
                 .header(
                     hyper::header::LOCATION,
-                    format!("/communities/{}", community_id),
+                    format!("/communities/{community_id}"),
                 )
                 .body("Successfully created.".into())?)
         }
@@ -779,7 +1151,7 @@ async fn handler_new_community_submit(
 }
 
 async fn page_notifications(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -801,17 +1173,8 @@ async fn page_notifications(
             )?)
             .await?,
     )
-    .map_err(crate::Error::from)
-    .and_then(|body| hyper::body::to_bytes(body).map_err(crate::Error::from))
+    .and_then(|response| crate::read_body_with_timeout(response.into_body()))
     .await;
-
-    // I really hope there's a better way to do this
-    // I need to return the error in the Err case, but only borrow the value from Ok
-    let api_res: Result<Result<RespList<RespNotification>, _>, _> = if api_res.is_ok() {
-        Ok(serde_json::from_slice(&api_res.as_ref().unwrap()))
-    } else {
-        Err(api_res.unwrap_err())
-    };
 
     let base_data =
         fetch_base_data(&ctx.backend_host, &ctx.http_client, req.headers(), &cookies).await?;
@@ -833,7 +1196,8 @@ async fn page_notifications(
         }
         Err(other) => Err(other),
         Ok(api_res) => {
-            let notifications = api_res?.items;
+            let api_res: RespList<RespNotification> = serde_json::from_slice(&api_res)?;
+            let notifications = api_res.items;
 
             Ok(html_response(render::html! {
                 <HTPage base_data={&base_data} lang={&lang} title={&title}>
@@ -859,7 +1223,7 @@ async fn page_notifications(
 }
 
 async fn page_signup(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -890,7 +1254,7 @@ async fn page_signup_inner(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let instance_info: RespInstanceInfo = serde_json::from_slice(&api_res)?;
 
     let can_signup_res = {
@@ -901,7 +1265,7 @@ async fn page_signup_inner(
                         format!(
                             "{}/api/unstable/invitations?{}",
                             ctx.backend_host,
-                            serde_urlencoded::to_string(&serde_json::json!({
+                            serde_urlencoded::to_string(serde_json::json!({
                                 "key": invitation_key
                             }))
                             .unwrap()
@@ -912,7 +1276,7 @@ async fn page_signup_inner(
                     .await?,
             )
             .await?;
-            let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+            let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
             let api_res: RespList<RespInvitationInfo> = serde_json::from_slice(&api_res)?;
 
             if let Some(info) = api_res.items.first() {
@@ -928,12 +1292,10 @@ async fn page_signup_inner(
                     Err(lang.tr(&lang::NO_SUCH_INVITATION))
                 }
             }
+        } else if instance_info.signup_allowed {
+            Ok(())
         } else {
-            if instance_info.signup_allowed {
-                Ok(())
-            } else {
-                Err(lang.tr(&lang::SIGNUP_NOT_ALLOWED))
-            }
+            Err(lang.tr(&lang::SIGNUP_NOT_ALLOWED))
         }
     };
 
@@ -992,7 +1354,7 @@ async fn page_signup_inner(
 }
 
 async fn handler_signup_submit(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -1003,7 +1365,7 @@ async fn handler_signup_submit(
 
     let (req_parts, body) = req.into_parts();
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let mut body: HashMap<Cow<'_, str>, serde_json::Value> = serde_urlencoded::from_bytes(&body)?;
     body.insert("login".into(), true.into());
     if body.get("email_address").and_then(|x| x.as_str()) == Some("") {
@@ -1047,7 +1409,7 @@ async fn handler_signup_submit(
 
     match api_res {
         Ok(api_res) => {
-            let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+            let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
             let api_res: UsersCreateResponse = serde_json::from_slice(&api_res)?;
 
             let token = api_res.token;
@@ -1056,7 +1418,7 @@ async fn handler_signup_submit(
                 .status(hyper::StatusCode::SEE_OTHER)
                 .header(
                     hyper::header::SET_COOKIE,
-                    format!("hitideToken={}; Path=/; Max-Age={}", token, COOKIE_AGE),
+                    format!("hitideToken={token}; Path=/; Max-Age={COOKIE_AGE}"),
                 )
                 .header(hyper::header::LOCATION, "/")
                 .body("Successfully registered new account.".into())?)
@@ -1101,7 +1463,7 @@ async fn page_user(
             .await?,
     )
     .await?;
-    let user = hyper::body::to_bytes(user.into_body()).await?;
+    let user = crate::read_body_with_timeout(user.into_body()).await?;
     let user: RespUserInfo<'_> = serde_json::from_slice(&user)?;
 
     let things = res_to_error(
@@ -1116,28 +1478,45 @@ async fn page_user(
             .await?,
     )
     .await?;
-    let things = hyper::body::to_bytes(things.into_body()).await?;
+    let things = crate::read_body_with_timeout(things.into_body()).await?;
     let things: RespList<RespThingInfo> = serde_json::from_slice(&things)?;
 
     let title = user.as_ref().username.as_ref();
 
+    let is_me = base_data
+        .login
+        .as_ref()
+        .is_some_and(|login| login.user.id == user_id);
+
     Ok(html_response(render::html! {
         <HTPage base_data={&base_data} lang={&lang} title>
-            <h1>{title}</h1>
-            <p><em>{format!("@{}@{}", user.as_ref().username, user.as_ref().host)}</em></p>
+            <div class={"userProfileHeader"}>
+                <UserAvatar user={user.as_ref()} class_name={"userAvatarLarge"} fallback={true} />
+                <div class={"userProfileTitle"}>
+                    <h1>{title}</h1>
+                    <p><em>{format!("@{}@{}", user.as_ref().username, user.as_ref().host)}</em></p>
+                    {
+                        is_me.then(|| {
+                            render::rsx! {
+                                <p class={"actionList small"}>
+                                    <a href={format!("/users/{}/edit", user_id)}>{"Edit profile and avatar"}</a>
+                                </p>
+                            }
+                        })
+                    }
+                </div>
+            </div>
             {
                 if user.as_ref().local {
                     None
-                } else if let Some(remote_url) = &user.as_ref().remote_url {
-                    Some(render::rsx! {
+                } else {
+                    user.as_ref().remote_url.as_ref().map(|remote_url| render::rsx! {
                         <div class={"infoBox"}>
                             {lang.tr(&lang::USER_REMOTE_NOTE)}
                             {" "}
-                            <a href={remote_url.as_ref()}>{lang.tr(&lang::VIEW_AT_SOURCE)}{" ↗"}</a>
+                            <a href={safe_href(remote_url).unwrap_or("#")}>{lang.tr(&lang::VIEW_AT_SOURCE)}{" ↗"}</a>
                         </div>
                     })
-                } else {
-                    None // shouldn't ever happen
                 }
             }
             {
@@ -1212,9 +1591,6 @@ async fn page_user(
                     if login.user.id == user_id {
                         Some(render::rsx! {
                             <>
-                                <div>
-                                    <a href={format!("/users/{}/edit", user_id)}>{lang.tr(&lang::EDIT)}</a>
-                                </div>
                                 {
                                     login.permissions.create_invitation.allowed.then(|| {
                                         render::rsx! {
@@ -1298,12 +1674,39 @@ async fn page_user_edit(
             .await?,
     )
     .await?;
-    let user = hyper::body::to_bytes(user.into_body()).await?;
+    let user = crate::read_body_with_timeout(user.into_body()).await?;
     let user: RespUserInfo<'_> = serde_json::from_slice(&user)?;
 
     Ok(html_response(render::html! {
         <HTPage base_data={&base_data} lang={&lang} title={&title}>
             <h1>{title.as_ref()}</h1>
+            <form method={"POST"} action={format!("/users/{}/edit/avatar", user_id)} enctype={"multipart/form-data"}>
+                <fieldset>
+                    <legend>{"Avatar"}</legend>
+                    {
+                        user.base.avatar.as_ref().map(|avatar| {
+                            render::rsx! {
+                                <div>
+                                    <img src={safe_href(avatar.url.as_ref()).unwrap_or("")} class={"userAvatarLarge"} alt={""} />
+                                </div>
+                            }
+                        })
+                    }
+                    <div>
+                        <label>
+                            {"Avatar image"}<br />
+                            <input type={"file"} name={"avatar_media"} accept={"image/*"} />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            <input type={"checkbox"} name={"remove_avatar"} />
+                            {" Remove avatar"}
+                        </label>
+                    </div>
+                    <button type={"submit"}>{"Upload avatar"}</button>
+                </fieldset>
+            </form>
             <form method={"POST"} action={format!("/users/{}/edit/submit", user_id)}>
                 <div>
                     <label>
@@ -1329,6 +1732,146 @@ async fn page_user_edit(
     }))
 }
 
+async fn handler_user_avatar_submit(
+    params: (i64,),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (user_id,) = params;
+    let (req_parts, body) = req.into_parts();
+    let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
+
+    let base_data = fetch_base_data(
+        &ctx.backend_host,
+        &ctx.http_client,
+        &req_parts.headers,
+        &cookies,
+    )
+    .await?;
+    let is_me = base_data
+        .login
+        .as_ref()
+        .is_some_and(|login| login.user.id == user_id);
+
+    if !is_me {
+        return Ok(hyper::Response::builder()
+            .status(hyper::StatusCode::FORBIDDEN)
+            .body("You can only update your own avatar.".into())?);
+    }
+
+    let content_type = req_parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .ok_or_else(|| {
+            crate::Error::UserError(crate::simple_response(
+                hyper::StatusCode::BAD_REQUEST,
+                "Avatar upload must be submitted as a multipart form.",
+            ))
+        })?;
+    let content_type = std::str::from_utf8(content_type.as_ref())?;
+    let boundary = multer::parse_boundary(content_type).map_err(|_| {
+        crate::Error::UserError(crate::simple_response(
+            hyper::StatusCode::BAD_REQUEST,
+            "Avatar upload must be submitted as a multipart form.",
+        ))
+    })?;
+
+    let mut multipart = multer::Multipart::new(body, boundary);
+    let mut remove_avatar = false;
+    let mut avatar = None;
+
+    loop {
+        let field = multipart.next_field().await?;
+        let field = match field {
+            None => break,
+            Some(field) => field,
+        };
+
+        let field_name = match field.name() {
+            None => continue,
+            Some(name) => name.to_owned(),
+        };
+
+        if field_name == "remove_avatar" {
+            remove_avatar = true;
+            continue;
+        }
+
+        if field_name == "avatar_media" {
+            use futures_util::StreamExt;
+
+            let mut stream = field.peekable();
+            let first_chunk = std::pin::Pin::new(&mut stream).peek().await;
+            let is_empty = match first_chunk {
+                None => true,
+                Some(Ok(chunk)) => chunk.is_empty(),
+                Some(Err(err)) => {
+                    return Err(crate::Error::InternalStr(format!(
+                        "failed parsing avatar form: {err:?}"
+                    )));
+                }
+            };
+
+            if is_empty {
+                continue;
+            }
+
+            let mime = stream.get_ref().content_type().ok_or_else(|| {
+                crate::Error::UserError(crate::simple_response(
+                    hyper::StatusCode::BAD_REQUEST,
+                    "Avatar image upload is missing a Content-Type.",
+                ))
+            })?;
+
+            let res = res_to_error(
+                ctx.http_client
+                    .request(for_client(
+                        hyper::Request::post(format!("{}/api/unstable/media", ctx.backend_host))
+                            .header(hyper::header::CONTENT_TYPE, mime.as_ref())
+                            .body(hyper::Body::wrap_stream(stream))?,
+                        &req_parts.headers,
+                        &cookies,
+                    )?)
+                    .await?,
+            )
+            .await?;
+
+            let res = crate::read_body_with_timeout(res.into_body()).await?;
+            let res: JustStringID = serde_json::from_slice(&res)?;
+
+            avatar = Some(format!("local-media://{}", res.id));
+        }
+    }
+
+    let body = if remove_avatar {
+        serde_json::json!({ "avatar": null })
+    } else if let Some(avatar) = avatar {
+        serde_json::json!({ "avatar": avatar })
+    } else {
+        return Ok(hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, format!("/users/{user_id}/edit"))
+            .body("No avatar image selected.".into())?);
+    };
+
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::patch(format!("{}/api/unstable/users/~me", ctx.backend_host))
+                    .body(serde_json::to_vec(&body)?.into())?,
+                &req_parts.headers,
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+
+    Ok(hyper::Response::builder()
+        .status(hyper::StatusCode::SEE_OTHER)
+        .header(hyper::header::LOCATION, format!("/users/{user_id}"))
+        .body("Avatar updated.".into())?)
+}
+
 async fn handler_user_edit_submit(
     params: (i64,),
     ctx: Arc<crate::RouteContext>,
@@ -1340,15 +1883,15 @@ async fn handler_user_edit_submit(
 
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let mut body: serde_json::map::Map<String, serde_json::Value> =
         serde_urlencoded::from_bytes(&body)?;
 
     // ignore password field if blank
-    if let Some(password) = body.get("password") {
-        if password == "" {
-            body.remove("password");
-        }
+    if let Some(password) = body.get("password")
+        && password == ""
+    {
+        body.remove("password");
     }
 
     body.insert("is_bot".to_owned(), body.contains_key("is_bot").into());
@@ -1367,7 +1910,7 @@ async fn handler_user_edit_submit(
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SEE_OTHER)
-        .header(hyper::header::LOCATION, format!("/users/{}", user_id))
+        .header(hyper::header::LOCATION, format!("/users/{user_id}"))
         .body("Successfully created.".into())?)
 }
 
@@ -1427,7 +1970,7 @@ async fn handler_user_suspend_submit(
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SEE_OTHER)
-        .header(hyper::header::LOCATION, format!("/users/{}", user_id))
+        .header(hyper::header::LOCATION, format!("/users/{user_id}"))
         .body("Successfully suspended.".into())?)
 }
 
@@ -1457,7 +2000,7 @@ async fn handler_user_suspend_undo(
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SEE_OTHER)
-        .header(hyper::header::LOCATION, format!("/users/{}", user_id))
+        .header(hyper::header::LOCATION, format!("/users/{user_id}"))
         .body("Successfully unsuspended.".into())?)
 }
 
@@ -1488,7 +2031,7 @@ async fn page_user_your_note_edit(
             .await?,
     )
     .await?;
-    let user = hyper::body::to_bytes(user.into_body()).await?;
+    let user = crate::read_body_with_timeout(user.into_body()).await?;
     let user: RespUserInfo<'_> = serde_json::from_slice(&user)?;
 
     let title = lang.tr(&lang::YOUR_NOTE_EDIT);
@@ -1519,7 +2062,7 @@ async fn handler_user_your_note_edit_submit(
 
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let body: serde_json::Value = serde_urlencoded::from_bytes(&body)?;
 
     res_to_error(
@@ -1539,12 +2082,12 @@ async fn handler_user_your_note_edit_submit(
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SEE_OTHER)
-        .header(hyper::header::LOCATION, format!("/users/{}", user_id))
+        .header(hyper::header::LOCATION, format!("/users/{user_id}"))
         .body("Successfully created.".into())?)
 }
 
 async fn page_home(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -1571,12 +2114,7 @@ async fn page_home(
                 hyper::Request::get(format!(
                     "{}/api/unstable/posts?{}",
                     ctx.backend_host,
-                    serde_urlencoded::to_string(&PostListQuery {
-                        in_your_follows: Some(true),
-                        include_your: Some(true),
-                        page: query.page.as_deref(),
-                        ..Default::default()
-                    })?,
+                    serde_urlencoded::to_string(home_posts_query(query.page.as_deref()))?,
                 ))
                 .body(Default::default())?,
                 req.headers(),
@@ -1586,14 +2124,14 @@ async fn page_home(
     )
     .await?;
 
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let api_res: RespList<RespPostListPost<'_>> = serde_json::from_slice(&api_res)?;
 
     let home_follow_prompt_src = lang::home_follow_prompt(lang::LangPlaceholder(0));
     let home_follow_prompt_src = lang.tr(&home_follow_prompt_src);
 
     Ok(html_response(render::html! {
-        <HTPage base_data={&base_data} lang={&lang} title={"lotide"}>
+        <HTPage base_data={&base_data} lang={&lang} title={base_data.site_name.as_str()}>
             {
                 if api_res.items.is_empty() {
                     Some(render::rsx! {
@@ -1638,7 +2176,7 @@ async fn page_home(
 }
 
 async fn page_all(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -1672,11 +2210,10 @@ async fn page_all_inner(
                 hyper::Request::get(format!(
                     "{}/api/unstable/posts?{}",
                     ctx.backend_host,
-                    serde_urlencoded::to_string(&PostListQuery {
-                        use_aggregate_filters: Some(true),
-                        page: query.page.as_deref(),
-                        ..Default::default()
-                    })?,
+                    serde_urlencoded::to_string(aggregate_posts_query(
+                        query.page.as_deref(),
+                        None,
+                    ))?,
                 ))
                 .body(Default::default())?,
                 headers,
@@ -1686,11 +2223,11 @@ async fn page_all_inner(
     )
     .await?;
 
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let api_res: RespList<RespPostListPost<'_>> = serde_json::from_slice(&api_res)?;
 
     Ok(html_response(render::html! {
-        <HTPage base_data={base_data} lang={&lang} title={"lotide"}>
+        <HTPage base_data={base_data} lang={&lang} title={base_data.site_name.as_str()}>
             <h1>{lang.tr(&lang::all_title())}</h1>
             {
                 if api_res.items.is_empty() {
@@ -1722,7 +2259,7 @@ async fn page_all_inner(
 }
 
 async fn page_flags(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -1760,8 +2297,7 @@ async fn page_flags(
             )?)
             .await?,
     )
-    .map_err(crate::Error::from)
-    .and_then(|api_res| hyper::body::to_bytes(api_res.into_body()).map_err(crate::Error::from))
+    .and_then(|api_res| crate::read_body_with_timeout(api_res.into_body()))
     .await;
 
     let title = match query {
@@ -1819,7 +2355,7 @@ async fn page_flags(
 }
 
 async fn page_local(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -1843,12 +2379,10 @@ async fn page_local(
                 hyper::Request::get(format!(
                     "{}/api/unstable/posts?{}",
                     ctx.backend_host,
-                    serde_urlencoded::to_string(&PostListQuery {
-                        use_aggregate_filters: Some(true),
-                        in_any_local_community: Some(true),
-                        page: query.page.as_deref(),
-                        ..Default::default()
-                    })?,
+                    serde_urlencoded::to_string(aggregate_posts_query(
+                        query.page.as_deref(),
+                        Some(true),
+                    ))?,
                 ))
                 .body(Default::default())?,
                 req.headers(),
@@ -1858,11 +2392,11 @@ async fn page_local(
     )
     .await?;
 
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let api_res: RespList<RespPostListPost<'_>> = serde_json::from_slice(&api_res)?;
 
     Ok(html_response(render::html! {
-        <HTPage base_data={&base_data} lang={&lang} title={"lotide"}>
+        <HTPage base_data={&base_data} lang={&lang} title={base_data.site_name.as_str()}>
             <h1>{lang.tr(&lang::local_title())}</h1>
             {
                 if api_res.items.is_empty() {
@@ -1906,6 +2440,27 @@ pub fn route_root() -> crate::RouteNode<()> {
             crate::RouteNode::new().with_handler_async(hyper::Method::GET, page_all),
         )
         .with_child("comments", comments::route_comments())
+        .with_child(
+            "collection_targets",
+            crate::RouteNode::new().with_child_parse::<i64, _>(
+                crate::RouteNode::new()
+                    .with_handler_async(hyper::Method::GET, page_collection_target)
+                    .with_child(
+                        "follow",
+                        crate::RouteNode::new().with_handler_async(
+                            hyper::Method::POST,
+                            handler_collection_target_follow,
+                        ),
+                    )
+                    .with_child(
+                        "unfollow",
+                        crate::RouteNode::new().with_handler_async(
+                            hyper::Method::POST,
+                            handler_collection_target_unfollow,
+                        ),
+                    ),
+            ),
+        )
         .with_child("communities", communities::route_communities())
         .with_child(
             "flags",
@@ -1985,6 +2540,13 @@ pub fn route_root() -> crate::RouteNode<()> {
                         crate::RouteNode::new()
                             .with_handler_async(hyper::Method::GET, page_user_edit)
                             .with_child(
+                                "avatar",
+                                crate::RouteNode::new().with_handler_async(
+                                    hyper::Method::POST,
+                                    handler_user_avatar_submit,
+                                ),
+                            )
+                            .with_child(
                                 "submit",
                                 crate::RouteNode::new().with_handler_async(
                                     hyper::Method::POST,
@@ -2025,4 +2587,75 @@ pub fn route_root() -> crate::RouteNode<()> {
                     ),
             ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::hyper;
+
+    fn has_param(src: &str, param: &str) -> bool {
+        src.split('&').any(|part| part == param)
+    }
+
+    #[test]
+    fn home_post_query_uses_new_sort() {
+        let query = serde_urlencoded::to_string(super::home_posts_query(Some("next-page")))
+            .expect("home post query should serialize");
+
+        assert!(has_param(&query, "include_your=true"));
+        assert!(has_param(&query, "in_your_follows=true"));
+        assert!(has_param(&query, "sort=new"));
+        assert!(has_param(&query, "page=next-page"));
+    }
+
+    #[test]
+    fn aggregate_post_queries_use_new_sort() {
+        let query =
+            serde_urlencoded::to_string(super::aggregate_posts_query(Some("2"), Some(true)))
+                .expect("aggregate post query should serialize");
+
+        assert!(has_param(&query, "use_aggregate_filters=true"));
+        assert!(has_param(&query, "in_any_local_community=true"));
+        assert!(has_param(&query, "sort=new"));
+        assert!(has_param(&query, "page=2"));
+    }
+
+    #[test]
+    fn cache_invalidating_response_sets_browser_and_proxy_headers() {
+        let res = super::cache_invalidating_response(hyper::Response::new(hyper::Body::empty()));
+
+        assert_eq!(
+            res.headers()[hyper::header::CACHE_CONTROL],
+            "no-store, no-cache, must-revalidate, max-age=0, private"
+        );
+        assert_eq!(res.headers()[hyper::header::PRAGMA], "no-cache");
+        assert_eq!(res.headers()[hyper::header::EXPIRES], "0");
+        assert_eq!(res.headers()["Clear-Site-Data"], "\"cache\"");
+        assert_eq!(res.headers()["Surrogate-Control"], "no-store");
+    }
+
+    #[test]
+    fn uncached_html_response_marks_discussion_pages_private_without_clearing_site_data() {
+        let res = super::uncached_html_response("body".to_owned());
+
+        assert_eq!(res.headers()[hyper::header::CONTENT_TYPE], "text/html");
+        assert_eq!(
+            res.headers()[hyper::header::CACHE_CONTROL],
+            "no-store, no-cache, must-revalidate, max-age=0, private"
+        );
+        assert_eq!(res.headers()[hyper::header::PRAGMA], "no-cache");
+        assert_eq!(res.headers()[hyper::header::EXPIRES], "0");
+        assert_eq!(res.headers()["Surrogate-Control"], "no-store");
+        assert!(!res.headers().contains_key("Clear-Site-Data"));
+    }
+
+    #[test]
+    fn cookie_parser_keeps_valid_cookies_when_a_fragment_is_malformed() {
+        let cookies = super::get_cookie_map(Some("badfragment; hitideToken=abc123; empty=;"))
+            .expect("malformed cookie fragments should be ignored");
+
+        assert_eq!(cookies.get("hitideToken").unwrap().value, "abc123");
+        assert_eq!(cookies.get("empty").unwrap().value, "");
+        assert!(!cookies.contains_key("badfragment"));
+    }
 }

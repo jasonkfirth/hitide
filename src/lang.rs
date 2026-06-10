@@ -27,19 +27,18 @@ impl Translator {
         let args = args.as_ref();
 
         let mut errors = Vec::with_capacity(0);
-        let out = match self.bundle.get_message(key) {
-            Some(msg) => self.bundle.format_pattern(
+        let out = if let Some(msg) = self.bundle.get_message(key) {
+            self.bundle.format_pattern(
                 msg.value().expect("Missing value for translation key"),
                 args,
                 &mut errors,
-            ),
-            None => {
-                log::error!("Missing translation for {}", key);
-                Cow::Borrowed(*key)
-            }
+            )
+        } else {
+            log::error!("Missing translation for {key}");
+            Cow::Borrowed(*key)
         };
         if !errors.is_empty() {
-            log::error!("Errors in translation: {:?}", errors);
+            log::error!("Errors in translation: {errors:?}");
         }
 
         out
@@ -60,7 +59,7 @@ pub struct LangKey<'a>(&'static str, Option<fluent::FluentArgs<'a>>);
 pub const PLACEHOLDER_BASE: u32 = '\u{fba00}' as u32;
 pub const PLACEHOLDER_MAX: u32 = PLACEHOLDER_BASE + (u8::MAX as u32);
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct LangPlaceholder(pub u8);
 
 impl fluent::types::FluentType for LangPlaceholder {
@@ -106,20 +105,22 @@ impl<'a, F: (Fn(u8, &mut dyn std::fmt::Write) -> std::fmt::Result)> TrElements<'
     }
 }
 
-impl<'a, F: (Fn(u8, &mut dyn std::fmt::Write) -> std::fmt::Result)> render::Render
-    for TrElements<'a, F>
+impl<F: (Fn(u8, &mut dyn std::fmt::Write) -> std::fmt::Result)> render::Render
+    for TrElements<'_, F>
 {
     fn render_into<W: std::fmt::Write + ?Sized>(self, mut writer: &mut W) -> std::fmt::Result {
         let mut covered = 0;
 
         for (idx, chr) in self.src.char_indices() {
             let chr_value: u32 = chr.into();
-            if chr_value >= PLACEHOLDER_BASE && chr_value <= PLACEHOLDER_MAX {
+            if (PLACEHOLDER_BASE..=PLACEHOLDER_MAX).contains(&chr_value) {
                 if idx > covered {
                     self.src[covered..idx].render_into(writer)?;
                 }
 
-                (self.render_placeholder)((chr_value - PLACEHOLDER_BASE) as u8, &mut writer)?;
+                let placeholder = u8::try_from(chr_value - PLACEHOLDER_BASE)
+                    .expect("placeholder codepoint range must fit in u8");
+                (self.render_placeholder)(placeholder, &mut writer)?;
 
                 covered = idx + chr.len_utf8();
             }
@@ -135,7 +136,7 @@ impl<'a, F: (Fn(u8, &mut dyn std::fmt::Write) -> std::fmt::Result)> render::Rend
 
 #[allow(unused)]
 pub mod keys {
-    use super::*;
+    use super::LangKey;
 
     include!(concat!(env!("OUT_DIR"), "/lang_keys.rs"));
 }

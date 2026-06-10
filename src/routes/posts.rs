@@ -1,19 +1,21 @@
-use super::JustStringID;
 use super::{
-    fetch_base_data, for_client, get_cookie_map_for_headers, get_cookie_map_for_req, html_response,
-    res_to_error, CookieMap,
+    CookieMap, cache_invalidating_response, fetch_base_data, for_client,
+    get_cookie_map_for_headers, get_cookie_map_for_req, html_response, res_to_error,
+    uncached_html_response,
 };
+use super::{JustStringID, communities::community_visibility_suppression_text};
 use crate::components::{
-    Comment, CommunityLink, ContentView, HTPage, IconExt, MaybeFillCheckbox, MaybeFillTextArea,
-    PollView, TimeAgo, UserLink,
+    Comment, CommunityLink, ContentView, FederationStatusBadge, HTPage, IconExt, MaybeFillCheckbox,
+    MaybeFillTextArea, PollView, SafeTimeAgo, UserLink, federation_status_line_class,
 };
+use crate::hyper;
 use crate::lang;
 use crate::query_types::PollVoteBody;
 use crate::resp_types::{
-    JustContentHTML, JustID, JustUser, RespCommunityInfoMaybeYour, RespList, RespPostCommentInfo,
-    RespPostInfo,
+    JustContentHTML, JustID, RespCommunityInfoMaybeYour, RespLikeInfo, RespList,
+    RespPostCommentInfo, RespPostInfo,
 };
-use crate::util::author_is_me;
+use crate::util::{author_is_me, safe_href};
 use render::Render;
 use serde_derive::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -87,7 +89,7 @@ async fn page_post_inner(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let post: RespPostInfo = serde_json::from_slice(&api_res)?;
 
     #[derive(Serialize)]
@@ -121,39 +123,56 @@ async fn page_post_inner(
             .await?,
     )
     .await?;
-    let replies_api_res = hyper::body::to_bytes(replies_api_res.into_body()).await?;
+    let replies_api_res = crate::read_body_with_timeout(replies_api_res.into_body()).await?;
     let replies: RespList<RespPostCommentInfo> = serde_json::from_slice(&replies_api_res)?;
 
-    let is_community_moderator = !post.as_ref().community.deleted
-        && if base_data.login.is_some() {
-            let api_res = res_to_error(
-                ctx.http_client
-                    .request(for_client(
-                        hyper::Request::get(format!(
-                            "{}/api/unstable/communities/{}?include_your=true",
-                            ctx.backend_host,
-                            post.as_ref().community.id,
-                        ))
-                        .body(Default::default())?,
-                        headers,
-                        cookies,
-                    )?)
-                    .await?,
-            )
-            .await?;
-            let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let community_info = if base_data.login.is_some() && !post.as_ref().community.deleted {
+        let api_res = res_to_error(
+            ctx.http_client
+                .request(for_client(
+                    hyper::Request::get(format!(
+                        "{}/api/unstable/communities/{}?include_your=true",
+                        ctx.backend_host,
+                        post.as_ref().community.id,
+                    ))
+                    .body(Default::default())?,
+                    headers,
+                    cookies,
+                )?)
+                .await?,
+        )
+        .await?;
+        let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
 
-            let info: RespCommunityInfoMaybeYour = serde_json::from_slice(&api_res)?;
-            info.you_are_moderator.unwrap()
-        } else {
-            false
-        };
+        Some(serde_json::from_slice::<RespCommunityInfoMaybeYour>(
+            &api_res,
+        )?)
+    } else {
+        None
+    };
+    let is_community_moderator = community_info
+        .as_ref()
+        .and_then(|info| info.you_are_moderator)
+        .unwrap_or(false);
+    let community_visibility_notice = community_visibility_suppression_text(
+        &lang,
+        community_info
+            .as_ref()
+            .and_then(|info| info.visibility_suppression.as_ref()),
+    );
+    let interaction_blocked = community_info
+        .as_ref()
+        .and_then(|info| info.visibility_suppression.as_ref())
+        .is_some_and(|suppression| suppression.server || suppression.user);
 
     let title = post.as_ref().as_ref().title.as_ref();
+    let vote_status = post
+        .your_vote
+        .as_ref()
+        .and_then(|vote| vote.federation_status);
+    let vote_class = format!("voteAction {}", federation_status_line_class(vote_status));
 
-    let created = chrono::DateTime::parse_from_rfc3339(&post.as_ref().created)?;
-
-    Ok(html_response(render::html! {
+    Ok(uncached_html_response(render::html! {
         <HTPage base_data={&base_data} lang={&lang} title={title}>
             {
                 if post.approved {
@@ -175,21 +194,33 @@ async fn page_post_inner(
                     if base_data.login.is_some() {
                         Some(if post.your_vote.is_some() {
                             render::rsx! {
-                                <>
+                                <span class={vote_class}>
                                     <form method={"POST"} action={format!("/posts/{}/unlike", post_id)} class={"inline"}>
                                         <button type={"submit"} class={"iconbutton"}>{hitide_icons::UPVOTED.img(lang.tr(&lang::remove_upvote()).into_owned())}</button>
                                     </form>
+                                    <FederationStatusBadge status={vote_status} />
                                     {" "}
-                                </>
+                                </span>
+                            }
+                        } else if interaction_blocked {
+                            render::rsx! {
+                                <span class={vote_class}>
+                                    <form method={"POST"} action={"#"} class={"inline"}>
+                                        <button type={"submit"} class={"iconbutton"} disabled={"disabled"}>{hitide_icons::UPVOTE.img(lang.tr(&lang::upvote()).into_owned())}</button>
+                                    </form>
+                                    <FederationStatusBadge status={vote_status} />
+                                    {" "}
+                                </span>
                             }
                         } else {
                             render::rsx! {
-                                <>
+                                <span class={vote_class}>
                                     <form method={"POST"} action={format!("/posts/{}/like", post_id)} class={"inline"}>
                                         <button type={"submit"} class={"iconbutton"}>{hitide_icons::UPVOTE.img(lang.tr(&lang::upvote()).into_owned())}</button>
                                     </form>
+                                    <FederationStatusBadge status={vote_status} />
                                     {" "}
-                                </>
+                                </span>
                             }
                         })
                     } else {
@@ -242,6 +273,13 @@ async fn page_post_inner(
                 }
             </div>
             <br />
+            {
+                community_visibility_notice.as_ref().map(|notice| {
+                    render::rsx! {
+                        <div class={"infoBox"}>{notice.as_ref()}</div>
+                    }
+                })
+            }
             <p>
                 {
                     lang::TrElements::new(
@@ -249,7 +287,7 @@ async fn page_post_inner(
                         |id, w| {
                             match id {
                                 0 => render::rsx! {
-                                    <TimeAgo since={created} lang={&lang} />
+                                    <SafeTimeAgo since={post.as_ref().created.as_ref()} lang={&lang} />
                                 }.render_into(w),
                                 1 => render::rsx! {
                                     <UserLink lang={&lang} user={post.as_ref().author.as_ref()} />
@@ -262,11 +300,13 @@ async fn page_post_inner(
                         }
                     )
                 }
+                {" "}
+                <FederationStatusBadge status={post.as_ref().federation_status} />
             </p>
             {
                 post.as_ref().href.as_ref().map(|href| {
                     render::rsx! {
-                        <p><a rel={"ugc noopener"} href={href.as_ref()}>{href.as_ref()}</a></p>
+                        <p><a rel={"ugc noopener"} href={safe_href(href).unwrap_or("#")}>{href.as_ref()}</a></p>
                     }
                 })
             }
@@ -310,13 +350,9 @@ async fn page_post_inner(
                     if post.local {
                         None
                     } else {
-                        if let Some(remote_url) = &post.as_ref().as_ref().remote_url {
-                            Some(render::rsx! {
-                                <a href={remote_url.as_ref()}>{lang.tr(&lang::remote_url()).into_owned()}</a>
-                            })
-                        } else {
-                            None
-                        }
+                        post.as_ref().as_ref().remote_url.as_ref().map(|remote_url| render::rsx! {
+                            <a href={safe_href(remote_url).unwrap_or("#")}>{lang.tr(&lang::remote_url()).into_owned()}</a>
+                        })
                     }
                 }
                 {
@@ -339,7 +375,7 @@ async fn page_post_inner(
                     })
                 }
                 {
-                    if base_data.login.is_some() {
+                    if base_data.login.is_some() && !interaction_blocked {
                         Some(render::rsx! {
                             <form method={"POST"} action={format!("/posts/{}/submit_reply", post.as_ref().as_ref().id)} enctype={"multipart/form-data"}>
                                 <div>
@@ -393,7 +429,7 @@ async fn page_post_inner(
                     {
                         replies.items.iter().map(|comment| {
                             render::rsx! {
-                                <Comment comment={comment} sort={query.sort} root_sensitive={post.as_ref().as_ref().sensitive} base_data={&base_data} lang={&lang} />
+                                <Comment comment={comment} sort={query.sort} root_sensitive={post.as_ref().as_ref().sensitive} base_data={&base_data} lang={&lang} interactions_blocked={interaction_blocked} />
                             }
                         }).collect::<Vec<_>>()
                     }
@@ -437,7 +473,7 @@ async fn page_post_delete(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
 
     let post: RespPostInfo = serde_json::from_slice(&api_res)?;
 
@@ -511,7 +547,7 @@ async fn page_post_site_block(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
 
     let post: RespPostInfo = serde_json::from_slice(&api_res)?;
 
@@ -552,7 +588,7 @@ async fn handler_post_site_block_confirm(
             .await?,
     )
     .await?;
-    let api_res_get = hyper::body::to_bytes(api_res_get.into_body()).await?;
+    let api_res_get = crate::read_body_with_timeout(api_res_get.into_body()).await?;
     let post: RespPostInfo = serde_json::from_slice(&api_res_get)?;
 
     if let Some(remote_url) = &post.as_ref().as_ref().remote_url {
@@ -563,7 +599,7 @@ async fn handler_post_site_block_confirm(
                         "{}/api/unstable/objects:blocks/{}",
                         ctx.backend_host,
                         percent_encoding::utf8_percent_encode(
-                            &remote_url,
+                            remote_url,
                             percent_encoding::NON_ALPHANUMERIC
                         ),
                     ))
@@ -615,7 +651,7 @@ async fn page_post_flag(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
 
     let post: RespPostInfo = serde_json::from_slice(&api_res)?;
 
@@ -630,7 +666,7 @@ async fn page_post_flag(
                 <div><label><input type={"checkbox"} name={"to_site_admin"} />{" "}{lang.tr(&lang::post_flag_target_choice_site_admin())}</label></div>
                 <div><label><input type={"checkbox"} name={"to_community"} />{" "}{lang.tr(&lang::post_flag_target_choice_community())}</label></div>
                 {
-                    (post.as_ref().author.as_ref().map(|x| x.local) == Some(false)).then(|| render::rsx! {
+                    post.as_ref().author.as_ref().is_some_and(|x| !x.local).then(|| render::rsx! {
                         <div><label><input type={"checkbox"} name={"to_remote_site_admin"} />{" "}{lang.tr(&lang::post_flag_target_choice_remote_site_admin()).into_owned()}</label></div>
                     })
                 }
@@ -659,7 +695,7 @@ async fn handler_post_flag_submit(
 
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let mut body: serde_json::map::Map<String, serde_json::Value> =
         serde_urlencoded::from_bytes(&body)?;
 
@@ -684,7 +720,7 @@ async fn handler_post_flag_submit(
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SEE_OTHER)
-        .header(hyper::header::LOCATION, format!("/posts/{}", post_id))
+        .header(hyper::header::LOCATION, format!("/posts/{post_id}"))
         .body("Successfully flagged.".into())?)
 }
 
@@ -714,7 +750,7 @@ async fn handler_post_like(
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SEE_OTHER)
-        .header(hyper::header::LOCATION, format!("/posts/{}", post_id))
+        .header(hyper::header::LOCATION, format!("/posts/{post_id}"))
         .body("Successfully liked.".into())?)
 }
 
@@ -745,8 +781,8 @@ async fn page_post_likes(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
-    let api_res: RespList<JustUser> = serde_json::from_slice(&api_res)?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
+    let api_res: RespList<RespLikeInfo> = serde_json::from_slice(&api_res)?;
 
     Ok(html_response(render::html! {
         <HTPage base_data={&base_data} lang={&lang} title={&lang.tr(&lang::likes())}>
@@ -767,7 +803,13 @@ async fn page_post_likes(
                         <ul>
                             {
                                 api_res.items.iter().map(|like| {
-                                    render::rsx! { <li><UserLink lang={&lang} user={Some(&like.user)} /></li> }
+                                    render::rsx! {
+                                        <li class={federation_status_line_class(like.federation_status)}>
+                                            <UserLink lang={&lang} user={Some(&like.user)} />
+                                            {" "}
+                                            <FederationStatusBadge status={like.federation_status} />
+                                        </li>
+                                    }
                                 })
                                 .collect::<Vec<_>>()
                             }
@@ -797,7 +839,7 @@ async fn handler_post_poll_submit(
     let (req_parts, body) = req.into_parts();
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let body: serde_json::map::Map<String, serde_json::Value> =
         serde_urlencoded::from_bytes(&body)?;
 
@@ -812,13 +854,7 @@ async fn handler_post_poll_submit(
     } else {
         let choices: Vec<_> = body
             .keys()
-            .filter_map(|key| {
-                if let Ok(key) = key.parse::<i64>() {
-                    Some(key)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|key| key.parse::<i64>().ok())
             .collect();
 
         PollVoteBody::Multiple { options: choices }
@@ -857,7 +893,7 @@ async fn handler_post_poll_submit(
         Err(other) => Err(other),
         Ok(_) => Ok(hyper::Response::builder()
             .status(hyper::StatusCode::SEE_OTHER)
-            .header(hyper::header::LOCATION, format!("/posts/{}", post_id))
+            .header(hyper::header::LOCATION, format!("/posts/{post_id}"))
             .body("Successfully voted.".into())?),
     }
 }
@@ -888,7 +924,7 @@ async fn handler_post_unlike(
 
     Ok(hyper::Response::builder()
         .status(hyper::StatusCode::SEE_OTHER)
-        .header(hyper::header::LOCATION, format!("/posts/{}", post_id))
+        .header(hyper::header::LOCATION, format!("/posts/{post_id}"))
         .body("Successfully unliked.".into())?)
 }
 
@@ -910,7 +946,7 @@ async fn handler_post_submit_reply(
             crate::Error::InternalStr("missing content-type header in form submission".to_owned())
         })?;
     let content_type = std::str::from_utf8(content_type.as_ref())?;
-    let boundary = multer::parse_boundary(&content_type)?;
+    let boundary = multer::parse_boundary(content_type)?;
 
     let mut multipart = multer::Multipart::new(body, boundary);
 
@@ -940,8 +976,7 @@ async fn handler_post_submit_reply(
                     Some(Ok(chunk)) => chunk.is_empty(),
                     Some(Err(err)) => {
                         return Err(crate::Error::InternalStr(format!(
-                            "failed parsing form: {:?}",
-                            err
+                            "failed parsing form: {err:?}"
                         )));
                     }
                 };
@@ -981,7 +1016,7 @@ async fn handler_post_submit_reply(
                                 return Err(other);
                             }
                             Ok(res) => {
-                                let res = hyper::body::to_bytes(res.into_body()).await?;
+                                let res = crate::read_body_with_timeout(res.into_body()).await?;
                                 let res: JustStringID = serde_json::from_slice(&res)?;
 
                                 body_values.insert(
@@ -1040,7 +1075,7 @@ async fn handler_post_submit_reply(
         .await;
         return match preview_res {
             Ok(preview_res) => {
-                let preview_res = hyper::body::to_bytes(preview_res.into_body()).await?;
+                let preview_res = crate::read_body_with_timeout(preview_res.into_body()).await?;
                 let preview_res: JustContentHTML = serde_json::from_slice(&preview_res)?;
 
                 page_post_inner(
@@ -1111,16 +1146,21 @@ async fn handler_post_submit_reply(
         }
         Err(other) => Err(other),
         Ok(api_res) => {
-            let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+            let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
             let api_res: JustID = serde_json::from_slice(&api_res)?;
 
-            Ok(hyper::Response::builder()
-                .status(hyper::StatusCode::SEE_OTHER)
-                .header(
-                    hyper::header::LOCATION,
-                    format!("/posts/{}#comment{}", post_id, api_res.id),
-                )
-                .body("Successfully posted.".into())?)
+            Ok(cache_invalidating_response(
+                hyper::Response::builder()
+                    .status(hyper::StatusCode::SEE_OTHER)
+                    .header(
+                        hyper::header::LOCATION,
+                        format!(
+                            "/posts/{}?fresh={}#comment{}",
+                            post_id, api_res.id, api_res.id
+                        ),
+                    )
+                    .body("Successfully posted.".into())?,
+            ))
         }
     }
 }

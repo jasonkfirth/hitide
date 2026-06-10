@@ -1,0 +1,22 @@
+[package]
+name = "render_macros"
+version = "0.3.1"
+authors = ["Gal Schlezinger <gal@spitfire.co.il>"]
+edition = "2018"
+description = "The macros needed for `render`"
+readme = "../README.md"
+repository = "https://github.com/Schniz/render.rs"
+keywords = ["macro"]
+categories = []
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "1.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+proc-macro-error3 = "3.0.1"

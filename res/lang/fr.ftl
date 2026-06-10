@@ -153,3 +153,4 @@ view_more_comments = Voir plus de commentaires
 your_note = Note personnelle
 your_note_add = Ajouter une note personnelle
 your_note_edit = Editer la note personnelle
+notification_user_follow = { $user } vous suit.

@@ -1,13 +1,19 @@
 use super::{
+    CookieMap, JustStringID, ReturnToParams, communities::community_visibility_suppression_text,
     default_comments_sort, fetch_base_data, for_client, get_cookie_map_for_headers,
-    get_cookie_map_for_req, html_response, res_to_error, CookieMap, JustStringID, ReturnToParams,
+    get_cookie_map_for_req, html_response, res_to_error, uncached_html_response,
 };
 use crate::components::{
-    Comment, ContentView, HTPage, IconExt, MaybeFillCheckbox, MaybeFillTextArea, TimeAgo, UserLink,
+    Comment, ContentView, FederationStatusBadge, HTPage, IconExt, MaybeFillCheckbox,
+    MaybeFillTextArea, SafeTimeAgo, UserLink, federation_status_line_class,
 };
+use crate::hyper;
 use crate::lang;
-use crate::resp_types::{JustContentHTML, JustID, RespCommentInfo, RespList, RespPostCommentInfo};
-use crate::util::{abbreviate_link, author_is_me};
+use crate::resp_types::{
+    JustContentHTML, JustID, RespCommentInfo, RespCommunityInfoMaybeYour, RespList,
+    RespPostCommentInfo, RespPostInfo,
+};
+use crate::util::{abbreviate_link, author_is_me, safe_href};
 use serde_derive::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -78,8 +84,65 @@ async fn page_comment_inner(
             .await?,
     )
     .await?;
-    let info_api_res = hyper::body::to_bytes(info_api_res.into_body()).await?;
+    let info_api_res = crate::read_body_with_timeout(info_api_res.into_body()).await?;
     let comment: RespCommentInfo<'_> = serde_json::from_slice(&info_api_res)?;
+
+    let community_info = if base_data.login.is_some() {
+        if let Some(post_ref) = comment.post.as_ref() {
+            let post_api_res = res_to_error(
+                ctx.http_client
+                    .request(for_client(
+                        hyper::Request::get(format!(
+                            "{}/api/unstable/posts/{}?include_your=true",
+                            ctx.backend_host, post_ref.id,
+                        ))
+                        .body(Default::default())?,
+                        headers,
+                        cookies,
+                    )?)
+                    .await?,
+            )
+            .await?;
+            let post_api_res = crate::read_body_with_timeout(post_api_res.into_body()).await?;
+            let post_info: RespPostInfo<'_> = serde_json::from_slice(&post_api_res)?;
+
+            let community_api_res = res_to_error(
+                ctx.http_client
+                    .request(for_client(
+                        hyper::Request::get(format!(
+                            "{}/api/unstable/communities/{}?include_your=true",
+                            ctx.backend_host,
+                            post_info.as_ref().community.id,
+                        ))
+                        .body(Default::default())?,
+                        headers,
+                        cookies,
+                    )?)
+                    .await?,
+            )
+            .await?;
+            let community_api_res =
+                crate::read_body_with_timeout(community_api_res.into_body()).await?;
+
+            Some(serde_json::from_slice::<RespCommunityInfoMaybeYour>(
+                &community_api_res,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let community_visibility_notice = community_visibility_suppression_text(
+        &lang,
+        community_info
+            .as_ref()
+            .and_then(|info| info.visibility_suppression.as_ref()),
+    );
+    let interaction_blocked = community_info
+        .as_ref()
+        .and_then(|info| info.visibility_suppression.as_ref())
+        .is_some_and(|suppression| suppression.server || suppression.user);
 
     #[derive(Serialize)]
     struct RepliesListQuery<'a> {
@@ -112,12 +175,18 @@ async fn page_comment_inner(
             .await?,
     )
     .await?;
-    let replies_api_res = hyper::body::to_bytes(replies_api_res.into_body()).await?;
+    let replies_api_res = crate::read_body_with_timeout(replies_api_res.into_body()).await?;
     let replies: RespList<RespPostCommentInfo<'_>> = serde_json::from_slice(&replies_api_res)?;
 
     let title = lang.tr(&lang::COMMENT);
+    let vote_status = comment
+        .as_ref()
+        .your_vote
+        .as_ref()
+        .and_then(|vote| vote.federation_status);
+    let vote_class = format!("voteAction {}", federation_status_line_class(vote_status));
 
-    Ok(html_response(render::html! {
+    Ok(uncached_html_response(render::html! {
         <HTPage base_data={&base_data} lang={&lang} title={&title}>
             {
                 comment.post.as_ref().map(|post| {
@@ -128,16 +197,29 @@ async fn page_comment_inner(
                     }
                 })
             }
+            {
+                community_visibility_notice.as_ref().map(|notice| {
+                    render::rsx! {
+                        <div class={"infoBox"}>{notice.as_ref()}</div>
+                    }
+                })
+            }
             <p>
                 {
                     if base_data.login.is_some() {
                         Some(render::rsx! {
-                            <>
+                            <span class={vote_class}>
                                 {
                                     if comment.as_ref().your_vote.is_some() {
                                         render::rsx! {
                                             <form method={"POST"} action={format!("/comments/{}/unlike", comment.as_ref().as_ref().id)}>
                                                 <button class={"iconbutton"} type={"submit"}>{hitide_icons::UPVOTED.img(lang.tr(&lang::remove_upvote()).into_owned())}</button>
+                                            </form>
+                                        }
+                                    } else if interaction_blocked {
+                                        render::rsx! {
+                                            <form method={"POST"} action={"#"}>
+                                                <button class={"iconbutton"} type={"submit"} disabled={"disabled"}>{hitide_icons::UPVOTE.img(lang.tr(&lang::upvote()).into_owned())}</button>
                                             </form>
                                         }
                                     } else {
@@ -148,7 +230,8 @@ async fn page_comment_inner(
                                         }
                                     }
                                 }
-                            </>
+                                <FederationStatusBadge status={vote_status} />
+                            </span>
                         })
                     } else {
                         None
@@ -166,17 +249,19 @@ async fn page_comment_inner(
                 <small>
                     <cite><UserLink lang={&lang} user={comment.as_ref().author.as_ref()} /></cite>
                     {" "}
-                    <TimeAgo since={chrono::DateTime::parse_from_rfc3339(&comment.as_ref().created).unwrap()} lang={&lang} />
+                    <SafeTimeAgo since={comment.as_ref().created.as_ref()} lang={&lang} />
+                    {" "}
+                    <FederationStatusBadge status={comment.as_ref().federation_status} />
                 </small>
                 <ContentView src={&comment} />
                 {
                     comment.as_ref().attachments.iter().map(|attachment| {
-                        let href = &attachment.url;
+                        let href = safe_href(&attachment.url).unwrap_or("#");
                         render::rsx! {
                             <div>
                                 <strong>{lang.tr(&lang::COMMENT_ATTACHMENT_PREFIX)}</strong>
                                 {" "}
-                                <em><a href={href.as_ref()}>{abbreviate_link(href)}{" ↗"}</a></em>
+                                <em><a href={href}>{abbreviate_link(href)}{" ↗"}</a></em>
                             </div>
                         }
                     })
@@ -185,16 +270,12 @@ async fn page_comment_inner(
             </p>
             <div class={"actionList"}>
                 {
-                    if !comment.as_ref().local {
-                        if let Some(remote_url) = &comment.as_ref().as_ref().remote_url {
-                            Some(render::rsx! {
-                                <a href={remote_url.as_ref()}>{lang.tr(&lang::remote_url()).into_owned()}</a>
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
+                    if comment.as_ref().local {
                         None
+                    } else {
+                        comment.as_ref().as_ref().remote_url.as_ref().map(|remote_url| render::rsx! {
+                            <a href={safe_href(remote_url).unwrap_or("#")}>{lang.tr(&lang::remote_url()).into_owned()}</a>
+                        })
                     }
                 }
                 {
@@ -215,7 +296,7 @@ async fn page_comment_inner(
                 })
             }
             {
-                if base_data.login.is_some() {
+                if base_data.login.is_some() && !interaction_blocked {
                     Some(render::rsx! {
                         <form method={"POST"} action={format!("/comments/{}/submit_reply", comment.as_ref().as_ref().id)} enctype={"multipart/form-data"}>
                             <div>
@@ -269,7 +350,7 @@ async fn page_comment_inner(
                 {
                     replies.items.iter().map(|reply| {
                         render::rsx! {
-                            <Comment comment={reply} sort={query.sort} root_sensitive={comment.as_ref().as_ref().sensitive} base_data={&base_data} lang={&lang} />
+                            <Comment comment={reply} sort={query.sort} root_sensitive={comment.as_ref().as_ref().sensitive} base_data={&base_data} lang={&lang} interactions_blocked={interaction_blocked} />
                         }
                     }).collect::<Vec<_>>()
                 }
@@ -325,7 +406,7 @@ async fn page_comment_delete_inner(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let comment: RespPostCommentInfo<'_> = serde_json::from_slice(&api_res)?;
 
     let title = lang.tr(&lang::COMMENT_DELETE_TITLE);
@@ -374,7 +455,7 @@ async fn handler_comment_delete_confirm(
 
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let body: ReturnToParams = serde_urlencoded::from_bytes(&body)?;
 
     let api_res = res_to_error(
@@ -398,7 +479,7 @@ async fn handler_comment_delete_confirm(
             .header(
                 hyper::header::LOCATION,
                 if let Some(return_to) = &body.return_to {
-                    &return_to
+                    return_to
                 } else {
                     "/"
                 },
@@ -448,7 +529,7 @@ async fn handler_comment_like(
             (if let Some(referer) = referer {
                 Cow::Borrowed(referer)
             } else {
-                format!("/comments/{}", comment_id).into()
+                format!("/comments/{comment_id}").into()
             })
             .as_ref(),
         )
@@ -491,7 +572,7 @@ async fn handler_comment_unlike(
             (if let Some(referer) = referer {
                 Cow::Borrowed(referer)
             } else {
-                format!("/comments/{}", comment_id).into()
+                format!("/comments/{comment_id}").into()
             })
             .as_ref(),
         )
@@ -517,7 +598,7 @@ async fn handler_comment_submit_reply(
             crate::Error::InternalStr("missing content-type header in form submission".to_owned())
         })?;
     let content_type = std::str::from_utf8(content_type.as_ref())?;
-    let boundary = multer::parse_boundary(&content_type)?;
+    let boundary = multer::parse_boundary(content_type)?;
 
     let mut multipart = multer::Multipart::new(body, boundary);
 
@@ -547,8 +628,7 @@ async fn handler_comment_submit_reply(
                     Some(Ok(chunk)) => chunk.is_empty(),
                     Some(Err(err)) => {
                         return Err(crate::Error::InternalStr(format!(
-                            "failed parsing form: {:?}",
-                            err
+                            "failed parsing form: {err:?}"
                         )));
                     }
                 };
@@ -588,7 +668,7 @@ async fn handler_comment_submit_reply(
                                 return Err(other);
                             }
                             Ok(res) => {
-                                let res = hyper::body::to_bytes(res.into_body()).await?;
+                                let res = crate::read_body_with_timeout(res.into_body()).await?;
                                 let res: JustStringID = serde_json::from_slice(&res)?;
 
                                 body_values.insert(
@@ -651,7 +731,7 @@ async fn handler_comment_submit_reply(
         .await;
         return match preview_res {
             Ok(preview_res) => {
-                let preview_res = hyper::body::to_bytes(preview_res.into_body()).await?;
+                let preview_res = crate::read_body_with_timeout(preview_res.into_body()).await?;
                 let preview_res: JustContentHTML = serde_json::from_slice(&preview_res)?;
 
                 page_comment_inner(
@@ -705,14 +785,17 @@ async fn handler_comment_submit_reply(
 
     match api_res {
         Ok(api_res) => {
-            let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+            let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
             let api_res: JustID = serde_json::from_slice(&api_res)?;
 
             Ok(hyper::Response::builder()
                 .status(hyper::StatusCode::SEE_OTHER)
                 .header(
                     hyper::header::LOCATION,
-                    format!("/comments/{}#comment{}", comment_id, api_res.id),
+                    format!(
+                        "/comments/{}?fresh={}#comment{}",
+                        comment_id, api_res.id, api_res.id
+                    ),
                 )
                 .body("Successfully posted.".into())?)
         }

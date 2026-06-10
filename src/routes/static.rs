@@ -1,3 +1,4 @@
+use crate::hyper;
 use hitide_icons::ICONS_MAP;
 use std::sync::Arc;
 

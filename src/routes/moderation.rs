@@ -3,10 +3,10 @@ use super::{
     res_to_error,
 };
 use crate::components::{FlagItem, HTPage};
+use crate::hyper;
 use crate::lang;
 use crate::resp_types::{RespCommunityInfoMaybeYour, RespFlagInfo, RespList};
 use serde_derive::Deserialize;
-use std::ops::Deref;
 use std::sync::Arc;
 
 async fn page_moderation(
@@ -42,7 +42,8 @@ async fn page_moderation(
     )
     .await?;
 
-    let communities_api_res = hyper::body::to_bytes(communities_api_res.into_body()).await?;
+    let communities_api_res =
+        crate::read_body_with_timeout(communities_api_res.into_body()).await?;
     let communities: RespList<RespCommunityInfoMaybeYour> =
         serde_json::from_slice(&communities_api_res)?;
 
@@ -61,7 +62,7 @@ async fn page_moderation(
                 .await?,
         )
         .await?;
-        Some(hyper::body::to_bytes(api_res.into_body()).await?)
+        Some(crate::read_body_with_timeout(api_res.into_body()).await?)
     } else {
         None
     };
@@ -78,7 +79,7 @@ async fn page_moderation(
                 {communities.items.iter().map(|community| {
                     render::rsx! {
                         <a class={if query.community == Some(community.base.id) { "selected" } else { "" }} href={format!("/moderation?community={}", community.base.id)}>
-                            {community.base.name.deref()}{" ("}{community.pending_moderation_actions.unwrap()}{")"}
+                            {&*community.base.name}{" ("}{community.pending_moderation_actions.unwrap()}{")"}
                         </a>
                     }
                 }).collect::<Vec<_>>()}
@@ -118,7 +119,7 @@ async fn handler_moderation_submit_dismiss(
     }
 
     let (req_parts, body) = req.into_parts();
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let body: Body = serde_urlencoded::from_bytes(&body)?;
 
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;

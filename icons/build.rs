@@ -19,7 +19,7 @@ fn main() {
             continue;
         }
 
-        println!("{:?}", path);
+        println!("{}", path.display());
 
         let content = std::fs::read_to_string(&path).unwrap();
 
@@ -30,7 +30,7 @@ fn main() {
         let key = format!("{}.svg", hash);
 
         let name = path.file_name().unwrap().to_str().unwrap();
-        let name = (&name[0..name.len() - 4]).to_ascii_uppercase();
+        let name = name[0..name.len() - 4].to_ascii_uppercase();
 
         let dark_invert = content.contains("<!--#darkInvert#-->");
 

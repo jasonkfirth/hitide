@@ -1,14 +1,15 @@
+use crate::hyper;
 use crate::lang;
 use crate::routes::{
-    fetch_base_data, for_client, get_cookie_map_for_headers, get_cookie_map_for_req, html_response,
-    res_to_error, CookieMap, HTPage,
+    CookieMap, HTPage, fetch_base_data, for_client, get_cookie_map_for_headers,
+    get_cookie_map_for_req, html_response, res_to_error,
 };
 use serde_derive::Deserialize;
 use std::borrow::Cow;
 use std::sync::Arc;
 
 async fn page_forgot_password(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -54,7 +55,7 @@ async fn page_forgot_password_inner(
 }
 
 async fn page_forgot_password_code(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -137,7 +138,7 @@ async fn page_forgot_password_code_reset_inner(
 }
 
 async fn handler_forgot_password_code_submit(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -151,7 +152,7 @@ async fn handler_forgot_password_code_submit(
 
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let body: CodeSubmitBody = serde_urlencoded::from_bytes(&body)?;
 
     if let Some(new_password) = body.new_password {
@@ -248,7 +249,7 @@ async fn handler_forgot_password_code_submit(
 }
 
 async fn handler_forgot_password_submit(
-    _: (),
+    (): (),
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
@@ -256,7 +257,7 @@ async fn handler_forgot_password_submit(
 
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let body: serde_json::Value = serde_urlencoded::from_bytes(&body)?;
 
     let api_res = res_to_error(

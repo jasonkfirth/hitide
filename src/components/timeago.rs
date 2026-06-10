@@ -1,5 +1,26 @@
 use crate::lang;
 
+pub struct SafeTimeAgo<'a> {
+    pub since: &'a str,
+    pub lang: &'a crate::Translator,
+}
+
+impl render::Render for SafeTimeAgo<'_> {
+    fn render_into<W: std::fmt::Write + ?Sized>(self, writer: &mut W) -> std::fmt::Result {
+        match chrono::DateTime::parse_from_rfc3339(self.since) {
+            Ok(since) => TimeAgo {
+                since,
+                lang: self.lang,
+            }
+            .render_into(writer),
+            Err(_) => render::rsx! {
+                <span title={self.since}>{self.since}</span>
+            }
+            .render_into(writer),
+        }
+    }
+}
+
 #[render::component]
 pub fn TimeAgo<'a>(
     since: chrono::DateTime<chrono::offset::FixedOffset>,
@@ -12,10 +33,10 @@ pub fn TimeAgo<'a>(
     let arg = {
         let weeks = duration.num_weeks();
         if weeks > 52 {
-            let years = ((weeks as f32) / 52.18).floor() as u32;
+            let years = u32::try_from(weeks / 52).unwrap_or(u32::MAX);
             lang::timeago_years(years)
         } else if weeks > 5 {
-            let months = (f32::from(weeks as i8) / 4.35).floor() as u8;
+            let months = u8::try_from((weeks * 100) / 435).unwrap_or(u8::MAX);
             lang::timeago_months(months)
         } else if weeks > 0 {
             lang::timeago_weeks(weeks)
@@ -50,5 +71,42 @@ pub fn TimeAgo<'a>(
 
     render::rsx! {
         <span title={since_str}>{text}</span>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use render::Render;
+
+    #[test]
+    fn safe_time_ago_renders_bad_timestamps_without_panicking() {
+        let lang = crate::get_lang_for_headers(&Default::default());
+        let mut html = String::new();
+
+        super::SafeTimeAgo {
+            since: "<bad timestamp>",
+            lang: &lang,
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(html.contains("&lt;bad timestamp&gt;"));
+        assert!(!html.contains("<bad timestamp>"));
+    }
+
+    #[test]
+    fn safe_time_ago_renders_valid_timestamps_as_timeago() {
+        let lang = crate::get_lang_for_headers(&Default::default());
+        let mut html = String::new();
+
+        super::SafeTimeAgo {
+            since: "2026-01-01T00:00:00+00:00",
+            lang: &lang,
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(html.contains("2026-01-01T00:00:00+00:00"));
+        assert!(!html.contains("&lt;"));
     }
 }

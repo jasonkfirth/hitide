@@ -3,17 +3,138 @@ pub mod timeago;
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 
+use crate::PageBaseData;
 use crate::lang;
 use crate::resp_types::{
-    Content, RespCommentInfo, RespFlagDetails, RespFlagInfo, RespMinimalAuthorInfo,
-    RespMinimalCommentInfo, RespMinimalCommunityInfo, RespNotification, RespNotificationInfo,
-    RespPollInfo, RespPostCommentInfo, RespPostInfo, RespPostListPost, RespSiteModlogEvent,
-    RespSiteModlogEventDetails, RespThingComment, RespThingInfo,
+    Content, RespCommentInfo, RespFederationStatus, RespFlagDetails, RespFlagInfo,
+    RespMinimalAuthorInfo, RespMinimalCommentInfo, RespMinimalCommunityInfo, RespNotification,
+    RespNotificationInfo, RespPollInfo, RespPostCommentInfo, RespPostInfo, RespPostListPost,
+    RespSiteModlogEvent, RespSiteModlogEventDetails, RespThingComment, RespThingInfo,
+    RespYourFollow,
 };
-use crate::util::{abbreviate_link, author_is_me};
-use crate::PageBaseData;
+use crate::util::{abbreviate_link, author_is_me, safe_href};
 
-pub use timeago::TimeAgo;
+pub use timeago::SafeTimeAgo;
+
+fn federation_status_text(status: RespFederationStatus) -> &'static str {
+    match status {
+        RespFederationStatus::Unsent => "federation: unsent",
+        RespFederationStatus::Sent => "federation: sent",
+        RespFederationStatus::Received => "federation: received",
+        RespFederationStatus::Posted => "federation: posted",
+    }
+}
+
+fn federation_status_class(status: RespFederationStatus) -> &'static str {
+    match status {
+        RespFederationStatus::Unsent => "federationStatus federationStatusUnsent",
+        RespFederationStatus::Sent => "federationStatus federationStatusSent",
+        RespFederationStatus::Received => "federationStatus federationStatusReceived",
+        RespFederationStatus::Posted => "federationStatus federationStatusPosted",
+    }
+}
+
+/*
+    Hitide does not infer federation state from page context. The backend owns
+    the delivery lifecycle, and the frontend only renders that state beside the
+    action or object that produced it.
+*/
+pub fn federation_status_line_class(status: Option<RespFederationStatus>) -> &'static str {
+    match status {
+        Some(RespFederationStatus::Unsent) => "federationStatusLine federationStatusLineUnsent",
+        Some(RespFederationStatus::Sent) => "federationStatusLine federationStatusLineSent",
+        Some(RespFederationStatus::Received) => "federationStatusLine federationStatusLineReceived",
+        Some(RespFederationStatus::Posted) => "federationStatusLine federationStatusLinePosted",
+        None => "",
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct FederationStatusBadge {
+    pub status: Option<RespFederationStatus>,
+}
+
+impl render::Render for FederationStatusBadge {
+    fn render_into<W: std::fmt::Write + ?Sized>(self, w: &mut W) -> std::fmt::Result {
+        if let Some(status) = self.status {
+            render::rsx! {
+                <span class={federation_status_class(status)} title={"Federation status"}>
+                    {federation_status_text(status)}
+                </span>
+            }
+            .render_into(w)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn follow_federation_status_badge_data(
+    your_follow: Option<&RespYourFollow>,
+    latest_unfollow_status: Option<RespFederationStatus>,
+) -> Option<(RespFederationStatus, &'static str)> {
+    /*
+        A plain "federation: received" label is not enough for follows. A
+        remote inbox can accept the request before the group or user sends the
+        ActivityPub Accept that makes the follow usable.
+    */
+    if let Some(follow) = your_follow {
+        return match follow.federation_status {
+            Some(RespFederationStatus::Unsent) => {
+                Some((RespFederationStatus::Unsent, "follow request: queued"))
+            }
+            Some(RespFederationStatus::Sent) => {
+                Some((RespFederationStatus::Sent, "follow request: sent"))
+            }
+            Some(RespFederationStatus::Received) => Some((
+                RespFederationStatus::Received,
+                "follow request: received by remote",
+            )),
+            Some(RespFederationStatus::Posted) => {
+                Some((RespFederationStatus::Posted, "follow request: accepted"))
+            }
+            None if !follow.accepted => {
+                Some((RespFederationStatus::Unsent, "follow request: pending"))
+            }
+            None => None,
+        };
+    }
+
+    latest_unfollow_status.map(|status| {
+        let label = match status {
+            RespFederationStatus::Unsent => "unfollow: queued",
+            RespFederationStatus::Sent => "unfollow: sent",
+            RespFederationStatus::Received | RespFederationStatus::Posted => {
+                "unfollow: received by remote"
+            }
+        };
+
+        (status, label)
+    })
+}
+
+#[derive(Clone, Copy)]
+pub struct FollowFederationStatusBadge<'a> {
+    pub your_follow: Option<&'a RespYourFollow>,
+    pub latest_unfollow_status: Option<RespFederationStatus>,
+}
+
+impl render::Render for FollowFederationStatusBadge<'_> {
+    fn render_into<W: std::fmt::Write + ?Sized>(self, w: &mut W) -> std::fmt::Result {
+        if let Some((status, label)) =
+            follow_federation_status_badge_data(self.your_follow, self.latest_unfollow_status)
+        {
+            render::rsx! {
+                <span class={federation_status_class(status)} title={"Follow federation status"}>
+                    {label}
+                </span>
+            }
+            .render_into(w)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[render::component]
 pub fn Comment<'a>(
@@ -22,20 +143,32 @@ pub fn Comment<'a>(
     root_sensitive: bool,
     base_data: &'a PageBaseData,
     lang: &'a crate::Translator,
+    interactions_blocked: bool,
 ) {
     let sensitive_hide = !root_sensitive && comment.as_ref().sensitive;
+    let vote_status = comment
+        .your_vote
+        .as_ref()
+        .and_then(|vote| vote.federation_status);
+    let vote_class = format!("votebox {}", federation_status_line_class(vote_status));
 
     render::rsx! {
         <li class={"comment"} id={format!("comment{}", comment.as_ref().id)}>
             {
                 if base_data.login.is_some() {
                     Some(render::rsx! {
-                        <div class={"votebox"}>
+                        <div class={vote_class}>
                             {
                                 if comment.your_vote.is_some() {
                                     render::rsx! {
                                         <form method={"POST"} action={format!("/comments/{}/unlike", comment.as_ref().id)}>
                                             <button class={"iconbutton"} type={"submit"}>{hitide_icons::UPVOTED.img(lang.tr(&lang::remove_upvote()).into_owned())}</button>
+                                        </form>
+                                    }
+                                } else if interactions_blocked {
+                                    render::rsx! {
+                                        <form method={"POST"} action={"#"}>
+                                            <button class={"iconbutton"} type={"submit"} disabled={"disabled"}>{hitide_icons::UPVOTE.img(lang.tr(&lang::upvote()).into_owned())}</button>
                                         </form>
                                     }
                                 } else {
@@ -46,6 +179,7 @@ pub fn Comment<'a>(
                                     }
                                 }
                             }
+                            <FederationStatusBadge status={vote_status} />
                         </div>
                     })
                 } else {
@@ -57,7 +191,9 @@ pub fn Comment<'a>(
                     <small>
                         <cite><UserLink lang user={comment.author.as_ref()} /></cite>
                         {" "}
-                        <TimeAgo since={chrono::DateTime::parse_from_rfc3339(&comment.created).unwrap()} lang />
+                        <SafeTimeAgo since={comment.created.as_ref()} lang />
+                        {" "}
+                        <FederationStatusBadge status={comment.federation_status} />
                     </small>
                 </summary>
                 <div class={"content"}>
@@ -76,19 +212,19 @@ pub fn Comment<'a>(
                             })
                         }
                         {
-                            (!sensitive_hide).then(|| {
+                            (!sensitive_hide).then_some({
                                 render::rsx! { <ContentView src={comment} /> }
                             })
                         }
                     </div>
                     {
                         comment.attachments.iter().map(|attachment| {
-                            let href = &attachment.url;
+                            let href = safe_href(&attachment.url).unwrap_or("#");
                             render::rsx! {
                                 <div>
                                     <strong>{lang.tr(&lang::COMMENT_ATTACHMENT_PREFIX)}</strong>
                                     {" "}
-                                    <em><a href={href.as_ref()}>{abbreviate_link(href)}{" ↗"}</a></em>
+                                    <em><a href={href}>{abbreviate_link(href)}{" ↗"}</a></em>
                                 </div>
                             }
                         })
@@ -96,7 +232,7 @@ pub fn Comment<'a>(
                     }
                     <div class={"actionList small"}>
                         {
-                            if base_data.login.is_some() {
+                            if base_data.login.is_some() && !interactions_blocked {
                                 Some(render::rsx! {
                                     <a href={format!("/comments/{}?sort={}", comment.as_ref().id, sort.as_str())}>{lang.tr(&lang::REPLY)}</a>
                                 })
@@ -105,16 +241,12 @@ pub fn Comment<'a>(
                             }
                         }
                         {
-                            if !comment.local {
-                                if let Some(remote_url) = &comment.as_ref().remote_url {
-                                    Some(render::rsx! {
-                                        <a href={remote_url.as_ref()}>{lang.tr(&lang::remote_url()).into_owned()}</a>
-                                    })
-                                } else {
-                                    None
-                                }
-                            } else {
+                            if comment.local {
                                 None
+                            } else {
+                                comment.as_ref().remote_url.as_ref().map(|remote_url| render::rsx! {
+                                    <a href={safe_href(remote_url).unwrap_or("#")}>{lang.tr(&lang::remote_url()).into_owned()}</a>
+                                })
                             }
                         }
                         {
@@ -140,7 +272,7 @@ pub fn Comment<'a>(
                                         {
                                             replies.items.iter().map(|reply| {
                                                 render::rsx! {
-                                                    <Comment sort={sort} comment={reply} root_sensitive base_data lang />
+                                                    <Comment sort={sort} comment={reply} root_sensitive base_data lang interactions_blocked={interactions_blocked} />
                                                 }
                                             })
                                             .collect::<Vec<_>>()
@@ -177,7 +309,7 @@ pub fn Comment<'a>(
 pub struct CommunityLink<'community> {
     pub community: &'community RespMinimalCommunityInfo<'community>,
 }
-impl<'community> render::Render for CommunityLink<'community> {
+impl render::Render for CommunityLink<'_> {
     fn render_into<W: std::fmt::Write + ?Sized>(self, writer: &mut W) -> std::fmt::Result {
         let community = &self.community;
 
@@ -209,7 +341,7 @@ pub trait HavingContent {
     fn content_html(&self) -> Option<&str>;
 }
 
-impl<'a> HavingContent for RespMinimalCommentInfo<'a> {
+impl HavingContent for RespMinimalCommentInfo<'_> {
     fn content_text(&self) -> Option<&str> {
         self.content_text.as_deref()
     }
@@ -218,7 +350,7 @@ impl<'a> HavingContent for RespMinimalCommentInfo<'a> {
     }
 }
 
-impl<'a> HavingContent for RespThingComment<'a> {
+impl HavingContent for RespThingComment<'_> {
     fn content_text(&self) -> Option<&str> {
         self.base.content_text()
     }
@@ -227,7 +359,7 @@ impl<'a> HavingContent for RespThingComment<'a> {
     }
 }
 
-impl<'a> HavingContent for RespPostCommentInfo<'a> {
+impl HavingContent for RespPostCommentInfo<'_> {
     fn content_text(&self) -> Option<&str> {
         self.base.content_text()
     }
@@ -236,7 +368,7 @@ impl<'a> HavingContent for RespPostCommentInfo<'a> {
     }
 }
 
-impl<'a> HavingContent for RespCommentInfo<'a> {
+impl HavingContent for RespCommentInfo<'_> {
     fn content_text(&self) -> Option<&str> {
         self.base.content_text()
     }
@@ -245,7 +377,7 @@ impl<'a> HavingContent for RespCommentInfo<'a> {
     }
 }
 
-impl<'a> HavingContent for RespPostInfo<'a> {
+impl HavingContent for RespPostInfo<'_> {
     fn content_text(&self) -> Option<&str> {
         self.content_text.as_deref()
     }
@@ -254,7 +386,7 @@ impl<'a> HavingContent for RespPostInfo<'a> {
     }
 }
 
-impl<'a> HavingContent for Content<'a> {
+impl HavingContent for Content<'_> {
     fn content_text(&self) -> Option<&str> {
         self.content_text.as_deref()
     }
@@ -269,7 +401,7 @@ pub struct HavingContentRef<'a> {
     content_text: Option<&'a str>,
 }
 
-impl<'a> HavingContent for HavingContentRef<'a> {
+impl HavingContent for HavingContentRef<'_> {
     fn content_text(&self) -> Option<&str> {
         self.content_text
     }
@@ -308,7 +440,7 @@ pub struct FlagItem<'a> {
     pub lang: &'a crate::Translator,
 }
 
-impl<'a> render::Render for FlagItem<'a> {
+impl render::Render for FlagItem<'_> {
     fn render_into<W: std::fmt::Write + ?Sized>(self, w: &mut W) -> std::fmt::Result {
         let Self {
             flag,
@@ -363,6 +495,13 @@ pub fn HTPage<'a, Children: render::Render>(
     }
 }
 
+pub fn site_stylesheet_href(base_data: &PageBaseData) -> &str {
+    base_data
+        .site_css_url
+        .as_deref()
+        .unwrap_or("/static/main.css")
+}
+
 #[render::component]
 pub fn HTPageAdvanced<'a, HeadItems: render::Render, Children: render::Render>(
     base_data: &'a PageBaseData,
@@ -379,6 +518,11 @@ pub fn HTPageAdvanced<'a, HeadItems: render::Render, Children: render::Render>(
             <a href={"/about"}>{lang.tr(&lang::ABOUT)}</a>
         </>
     };
+    let document_title = if title == base_data.site_name.as_str() {
+        title.to_owned()
+    } else {
+        format!("{} - {}", title, base_data.site_name)
+    };
 
     render::rsx! {
         <>
@@ -388,13 +532,21 @@ pub fn HTPageAdvanced<'a, HeadItems: render::Render, Children: render::Render>(
                 dir={match lang.primary_language().character_direction() {
                     unic_langid::CharacterDirection::LTR => "ltr",
                     unic_langid::CharacterDirection::RTL => "rtl",
-                }}
+                    unic_langid::CharacterDirection::TTB => "ttb"
+                 }}
             >
                 <head>
                     <meta charset={"utf-8"} />
                     <meta name={"viewport"} content={"width=device-width, initial-scale=1"} />
-                    <link rel={"stylesheet"} href={"/static/main.css"} />
-                    <title>{title}</title>
+                    <link rel={"stylesheet"} href={safe_href(site_stylesheet_href(base_data)).unwrap_or("/static/main.css")} />
+                    {
+                        base_data.site_logo_url.as_ref().map(|site_logo_url| {
+                            render::rsx! {
+                                <link rel={"icon"} href={safe_href(site_logo_url).unwrap_or("")} />
+                            }
+                        })
+                    }
+                    <title>{document_title}</title>
                     {head_items}
                 </head>
                 <body>
@@ -406,7 +558,16 @@ pub fn HTPageAdvanced<'a, HeadItems: render::Render, Children: render::Render>(
                                     {left_links.clone()}
                                 </div>
                             </details>
-                            <a href={"/"} class={"siteName"}>{"lotide"}</a>
+                            <a href={"/"} class={"siteName"}>
+                                {
+                                    base_data.site_logo_url.as_ref().map(|site_logo_url| {
+                                        render::rsx! {
+                                            <img src={safe_href(site_logo_url).unwrap_or("")} class={"siteLogo"} alt={""} />
+                                        }
+                                    })
+                                }
+                                {base_data.site_name.as_str()}
+                            </a>
                             <div class={"actionList leftLinks"}>
                                 {left_links}
                             </div>
@@ -503,7 +664,7 @@ pub struct PostItemContent<'a> {
     lang: &'a crate::Translator,
 }
 
-impl<'a> render::Render for PostItemContent<'a> {
+impl render::Render for PostItemContent<'_> {
     fn render_into<W: std::fmt::Write + ?Sized>(self, w: &mut W) -> std::fmt::Result {
         let Self {
             post,
@@ -523,8 +684,9 @@ impl<'a> render::Render for PostItemContent<'a> {
                     </a>
                     {
                         post.as_ref().href.as_ref().map(|href| {
+                            let href = safe_href(href).unwrap_or("#");
                             render::rsx! {
-                                <em><a href={href.as_ref()}>{abbreviate_link(href)}{" ↗"}</a></em>
+                                <em><a href={href}>{abbreviate_link(href)}{" ↗"}</a></em>
                             }
                         })
                     }
@@ -541,7 +703,7 @@ impl<'a> render::Render for PostItemContent<'a> {
                             |id, w| {
                                 match id {
                                     0 => render::rsx! {
-                                        <TimeAgo since={chrono::DateTime::parse_from_rfc3339(&post.as_ref().created).unwrap()} lang />
+                                        <SafeTimeAgo since={post.as_ref().created.as_ref()} lang />
                                     }.render_into(w),
                                     1 => render::rsx! {
                                         <UserLink lang user={post.as_ref().author.as_ref()} />
@@ -556,6 +718,8 @@ impl<'a> render::Render for PostItemContent<'a> {
                     }
                     {" | "}
                     <a href={post_href}>{lang.tr(&lang::post_comments_count(post.replies_count_total)).into_owned()}</a>
+                    {" "}
+                    <FederationStatusBadge status={post.as_ref().federation_status} />
                 </small>
             </>
         }.render_into(w)
@@ -567,7 +731,7 @@ pub struct ThingItem<'a> {
     pub thing: &'a RespThingInfo<'a>,
 }
 
-impl<'a> render::Render for ThingItem<'a> {
+impl render::Render for ThingItem<'_> {
     fn render_into<W: std::fmt::Write + ?Sized>(self, writer: &mut W) -> std::fmt::Result {
         let lang = self.lang;
 
@@ -594,8 +758,8 @@ impl<'a> render::Render for ThingItem<'a> {
                                                     {comment.post.title.as_ref()}
                                                 </a>
                                             }.render_into(w),
-                                            2 => TimeAgo {
-                                                since: chrono::DateTime::parse_from_rfc3339(&comment.created).unwrap(),
+                                            2 => SafeTimeAgo {
+                                                since: comment.created.as_ref(),
                                                 lang,
                                             }.render_into(w),
                                             _ => unreachable!(),
@@ -603,6 +767,8 @@ impl<'a> render::Render for ThingItem<'a> {
                                     }
                                 )
                             }
+                            {" "}
+                            <FederationStatusBadge status={comment.federation_status} />
                         </small>
                         <ContentView src={comment} />
                     </li>
@@ -617,14 +783,52 @@ pub struct UserLink<'a> {
     pub user: Option<&'a RespMinimalAuthorInfo<'a>>,
 }
 
-impl<'user> render::Render for UserLink<'user> {
+pub struct UserAvatar<'a> {
+    pub user: &'a RespMinimalAuthorInfo<'a>,
+    pub class_name: &'static str,
+    pub fallback: bool,
+}
+
+impl render::Render for UserAvatar<'_> {
+    fn render_into<W: std::fmt::Write + ?Sized>(self, writer: &mut W) -> std::fmt::Result {
+        if let Some(avatar) = &self.user.avatar {
+            render::rsx! {
+                <img
+                    src={safe_href(avatar.url.as_ref()).unwrap_or("")}
+                    class={self.class_name}
+                    alt={""}
+                    loading={"lazy"}
+                />
+            }
+            .render_into(writer)
+        } else if self.fallback {
+            let initial = self
+                .user
+                .username
+                .chars()
+                .next()
+                .map_or_else(|| "?".to_owned(), |ch| ch.to_uppercase().to_string());
+            let class_name = format!("{} userAvatarPlaceholder", self.class_name);
+
+            render::rsx! {
+                <span class={class_name} aria-hidden={"true"}>{initial}</span>
+            }
+            .render_into(writer)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl render::Render for UserLink<'_> {
     fn render_into<W: std::fmt::Write + ?Sized>(self, writer: &mut W) -> std::fmt::Result {
         match self.user {
             None => "[unknown]".render_into(writer),
             Some(user) => {
                 let href = format!("/users/{}", user.id);
                 (render::rsx! {
-                    <a href={&href}>
+                    <a href={&href} class={"userLink"}>
+                        <UserAvatar user class_name={"userAvatarSmall"} fallback={false} />
                         {
                             (if user.local {
                                 user.username.as_ref().into()
@@ -715,7 +919,9 @@ pub fn MaybeFillCheckbox<'a, M: GetIndex<&'a str, serde_json::Value>>(
     id: &'a str,
     default: bool,
 ) {
-    let checked = values.map(|x| x.get(name).is_some()).unwrap_or(default);
+    let checked = values
+        .and_then(|x| x.get(name))
+        .map_or(default, |x| x.as_bool().unwrap_or(true));
     log::debug!(
         "MaybeFillCheckbox {} checked={} (values? {})",
         name,
@@ -820,7 +1026,7 @@ pub struct NotificationItem<'a> {
     pub lang: &'a crate::Translator,
 }
 
-impl<'a> render::Render for NotificationItem<'a> {
+impl render::Render for NotificationItem<'_> {
     fn render_into<W: std::fmt::Write + ?Sized>(self, writer: &mut W) -> std::fmt::Result {
         let lang = self.lang;
 
@@ -862,7 +1068,7 @@ impl<'a> render::Render for NotificationItem<'a> {
                             <small>
                                 <cite><UserLink lang user={reply.author.as_ref()} /></cite>
                                 {" "}
-                                <TimeAgo since={chrono::DateTime::parse_from_rfc3339(&reply.created).unwrap()} lang />
+                                <SafeTimeAgo since={reply.created.as_ref()} lang />
                             </small>
                             <ContentView src={reply} />
                         </div>
@@ -914,7 +1120,7 @@ impl<'a> render::Render for NotificationItem<'a> {
                             <small>
                                 <cite><UserLink lang user={reply.author.as_ref()} /></cite>
                                 {" "}
-                                <TimeAgo since={chrono::DateTime::parse_from_rfc3339(&reply.created).unwrap()} lang />
+                                <SafeTimeAgo since={reply.created.as_ref()} lang />
                             </small>
                             <ContentView src={reply} />
                         </div>
@@ -949,13 +1155,33 @@ impl<'a> render::Render for NotificationItem<'a> {
                                 <small>
                                     <cite><UserLink lang user={comment.author.as_ref()} /></cite>
                                     {" "}
-                                    <TimeAgo since={chrono::DateTime::parse_from_rfc3339(&comment.created).unwrap()} lang />
+                                    <SafeTimeAgo since={comment.created.as_ref()} lang />
                                 </small>
                                 <ContentView src={comment} />
                             </div>
                         </div>
                     </>
                 }).render_into(writer)?;
+            }
+            RespNotificationInfo::UserFollow { user } => {
+                (render::rsx! {
+                    <div>
+                        {
+                            lang::TrElements::new(
+                                lang.tr(&lang::notification_user_follow(lang::LangPlaceholder(0))),
+                                |id, w| {
+                                    match id {
+                                        0 => render::rsx! {
+                                            <UserLink lang user={Some(user)} />
+                                        }.render_into(w),
+                                        _ => unreachable!(),
+                                    }
+                                },
+                            )
+                        }
+                    </div>
+                })
+                .render_into(writer)?;
             }
         }
 
@@ -968,7 +1194,7 @@ pub struct SiteModlogEventItem<'a> {
     pub lang: &'a crate::Translator,
 }
 
-impl<'a> render::Render for SiteModlogEventItem<'a> {
+impl render::Render for SiteModlogEventItem<'_> {
     fn render_into<W: std::fmt::Write + ?Sized>(self, writer: &mut W) -> std::fmt::Result {
         let lang = self.lang;
         let event = &self.event;
@@ -977,10 +1203,11 @@ impl<'a> render::Render for SiteModlogEventItem<'a> {
 
         (render::rsx! {
             <>
-                <TimeAgo since={chrono::DateTime::parse_from_rfc3339(&event.time).unwrap()} lang={&lang} />
+                <SafeTimeAgo since={event.time.as_ref()} lang />
                 {" - "}
             </>
-        }).render_into(writer)?;
+        })
+        .render_into(writer)?;
 
         match &event.details {
             RespSiteModlogEventDetails::DeletePost { author, community } => {
@@ -991,7 +1218,7 @@ impl<'a> render::Render for SiteModlogEventItem<'a> {
                     )),
                     |id, w| match id {
                         0 => render::rsx! {
-                            <UserLink user={Some(author)} lang={&lang} />
+                            <UserLink user={Some(author)} lang={lang} />
                         }
                         .render_into(w),
                         1 => render::rsx! {
@@ -1011,7 +1238,7 @@ impl<'a> render::Render for SiteModlogEventItem<'a> {
                     )),
                     |id, w| match id {
                         0 => render::rsx! {
-                            <UserLink user={Some(author)} lang={&lang} />
+                            <UserLink user={Some(author)} lang={lang} />
                         }
                         .render_into(w),
                         1 => render::rsx! {
@@ -1028,7 +1255,7 @@ impl<'a> render::Render for SiteModlogEventItem<'a> {
                     <>
                         {lang.tr(&lang::MODLOG_EVENT_SUSPEND_USER)}
                         {" "}
-                        <UserLink user={Some(user)} lang={&lang} />
+                        <UserLink user={Some(user)} lang={lang} />
                     </>
                 })
                 .render_into(writer)?;
@@ -1038,7 +1265,7 @@ impl<'a> render::Render for SiteModlogEventItem<'a> {
                     <>
                         {lang.tr(&lang::MODLOG_EVENT_UNSUSPEND_USER)}
                         {" "}
-                        <UserLink user={Some(user)} lang={&lang} />
+                        <UserLink user={Some(user)} lang={lang} />
                     </>
                 })
                 .render_into(writer)?;
@@ -1056,7 +1283,7 @@ pub struct PollView<'a> {
     pub action: String,
     pub lang: &'a crate::Translator,
 }
-impl<'a> render::Render for PollView<'a> {
+impl render::Render for PollView<'_> {
     fn render_into<W: std::fmt::Write + ?Sized>(self, writer: &mut W) -> std::fmt::Result {
         let PollView { poll, action, lang } = &self;
 
@@ -1072,7 +1299,7 @@ impl<'a> render::Render for PollView<'a> {
                     <table class={"pollResults"}>
                         {
                             poll.options.iter().map(|option| {
-                                let selected = poll.your_vote.as_ref().map(|your_vote| your_vote.options.iter().any(|x| x.id == option.id)).unwrap_or(false);
+                                let selected = poll.your_vote.as_ref().is_some_and(|your_vote| your_vote.options.iter().any(|x| x.id == option.id));
                                 render::rsx! {
                                     <tr class={if selected { "selected" } else { "" }}>
                                         <td class={"count"}>
@@ -1140,5 +1367,244 @@ impl IconExt for hitide_icons::Icon {
         render::rsx! {
             <img src={format!("/static/{}", self.path)} class={if self.dark_invert { "icon darkInvert" } else { "icon" }} aria-hidden={"true"} />
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use render::Render;
+
+    #[test]
+    fn site_stylesheet_href_uses_custom_css_or_bundled_default() {
+        let mut base_data = crate::PageBaseData {
+            login: None,
+            site_name: "lotide".to_owned(),
+            site_logo_url: None,
+            site_css_url: None,
+        };
+
+        assert_eq!(site_stylesheet_href(&base_data), "/static/main.css");
+
+        base_data.site_css_url = Some("/api/stable/instance/stylesheet".to_owned());
+
+        assert_eq!(
+            site_stylesheet_href(&base_data),
+            "/api/stable/instance/stylesheet"
+        );
+    }
+
+    fn minimal_post_with_href<'a>(href: Option<&'a str>) -> RespPostListPost<'a> {
+        RespPostListPost {
+            base: crate::resp_types::RespSomePostInfo {
+                base: crate::resp_types::RespMinimalPostInfo {
+                    id: 42,
+                    title: "test post".into(),
+                    remote_url: None,
+                    sensitive: false,
+                },
+                href: href.map(Cow::Borrowed),
+                author: Some(crate::resp_types::RespMinimalAuthorInfo {
+                    id: 7,
+                    username: "alice".into(),
+                    local: false,
+                    host: "remote.example".into(),
+                    remote_url: None,
+                    avatar: None,
+                    is_bot: false,
+                }),
+                created: "2026-01-01T00:00:00+00:00".into(),
+                community: crate::resp_types::RespMinimalCommunityInfo {
+                    id: 3,
+                    name: "test".into(),
+                    local: false,
+                    host: "remote.example".into(),
+                    remote_url: None,
+                    deleted: false,
+                },
+                sticky: false,
+                federation_status: None,
+            },
+            replies_count_total: 0,
+        }
+    }
+
+    #[test]
+    fn federation_status_badge_and_line_class_render_delivery_state() {
+        let mut html = String::new();
+
+        FederationStatusBadge {
+            status: Some(RespFederationStatus::Received),
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(html.contains("federationStatusReceived"));
+        assert!(html.contains("federation: received"));
+        assert_eq!(
+            federation_status_line_class(Some(RespFederationStatus::Sent)),
+            "federationStatusLine federationStatusLineSent"
+        );
+        assert_eq!(federation_status_line_class(None), "");
+    }
+
+    #[test]
+    fn follow_federation_status_badge_explains_follow_lifecycle() {
+        let follow = RespYourFollow {
+            accepted: false,
+            federation_status: Some(RespFederationStatus::Received),
+        };
+        let mut html = String::new();
+
+        FollowFederationStatusBadge {
+            your_follow: Some(&follow),
+            latest_unfollow_status: None,
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(html.contains("follow request: received by remote"));
+        assert!(html.contains("federationStatusReceived"));
+
+        html.clear();
+        FollowFederationStatusBadge {
+            your_follow: None,
+            latest_unfollow_status: Some(RespFederationStatus::Sent),
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(html.contains("unfollow: sent"));
+        assert!(html.contains("federationStatusSent"));
+    }
+
+    #[test]
+    fn notification_item_renders_user_follow() {
+        let lang = crate::get_lang_for_headers(&Default::default());
+        let notification = RespNotification {
+            info: RespNotificationInfo::UserFollow {
+                user: RespMinimalAuthorInfo {
+                    id: 7,
+                    username: "remote_alice".into(),
+                    local: false,
+                    host: "social.example".into(),
+                    remote_url: Some("https://social.example/users/remote_alice".into()),
+                    avatar: None,
+                    is_bot: false,
+                },
+            },
+            unseen: true,
+        };
+        let mut html = String::new();
+
+        NotificationItem {
+            notification: &notification,
+            lang: &lang,
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(html.contains("remote_alice"));
+        assert!(html.contains("followed you"));
+        assert!(html.contains("notification-item unread"));
+    }
+
+    #[test]
+    fn user_link_renders_avatar_when_available() {
+        let lang = crate::get_lang_for_headers(&Default::default());
+        let user = RespMinimalAuthorInfo {
+            id: 7,
+            username: "alice".into(),
+            local: true,
+            host: "lotide.example".into(),
+            remote_url: None,
+            avatar: Some(crate::resp_types::JustURL {
+                url: "/api/stable/users/7/avatar/href".into(),
+            }),
+            is_bot: false,
+        };
+        let mut html = String::new();
+
+        UserLink {
+            lang: &lang,
+            user: Some(&user),
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(html.contains("class=\"userLink\""));
+        assert!(html.contains("class=\"userAvatarSmall\""));
+        assert!(html.contains("/api/stable/users/7/avatar/href"));
+        assert!(html.contains("alice"));
+    }
+
+    #[test]
+    fn content_view_escapes_plain_text_from_remote_sources() {
+        let content = HavingContentRef {
+            content_html: None,
+            content_text: Some("<script>alert(1)</script>"),
+        };
+        let mut html = String::new();
+
+        ContentView { src: &content }
+            .render_into(&mut html)
+            .unwrap();
+
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn content_view_preserves_backend_sanitized_html() {
+        let content = HavingContentRef {
+            content_html: Some("<p><strong>ok</strong></p>"),
+            content_text: Some("fallback"),
+        };
+        let mut html = String::new();
+
+        ContentView { src: &content }
+            .render_into(&mut html)
+            .unwrap();
+
+        assert!(html.contains("<p><strong>ok</strong></p>"));
+        assert!(!html.contains("fallback"));
+    }
+
+    #[test]
+    fn post_item_content_neutralizes_unsafe_remote_href() {
+        let lang = crate::get_lang_for_headers(&Default::default());
+        let post = minimal_post_with_href(Some("javascript:alert(1)"));
+        let mut html = String::new();
+
+        PostItemContent {
+            post: &post,
+            in_community: false,
+            no_user: false,
+            lang: &lang,
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(!html.contains("href=\"javascript:alert(1)\""));
+        assert!(html.contains("href=\"#\""));
+    }
+
+    #[test]
+    fn post_item_content_keeps_safe_remote_href() {
+        let lang = crate::get_lang_for_headers(&Default::default());
+        let post = minimal_post_with_href(Some("https://example.com/article"));
+        let mut html = String::new();
+
+        PostItemContent {
+            post: &post,
+            in_community: false,
+            no_user: false,
+            lang: &lang,
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(html.contains("href=\"https://example.com/article\""));
+        assert!(html.contains("example.com"));
     }
 }

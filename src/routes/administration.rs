@@ -1,15 +1,176 @@
 use super::{
-    fetch_base_data, for_client, get_cookie_map_for_headers, get_cookie_map_for_req, html_response,
-    res_to_error, CookieMap,
+    CookieMap, JustStringID, fetch_base_data, for_client, get_cookie_map_for_headers,
+    get_cookie_map_for_req, html_response, res_to_error,
 };
-use crate::components::{HTPage, MaybeFillOption, MaybeFillTextArea};
+use crate::components::{
+    HTPage, MaybeFillCheckbox, MaybeFillOption, MaybeFillTextArea, maybe_fill_value,
+};
+use crate::hyper;
 use crate::lang;
-use crate::resp_types::RespInstanceInfo;
+use crate::resp_types::{RespAdminFederationHealth, RespInstanceInfo};
+use crate::util::safe_href;
 use render::Render;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::sync::Arc;
+
+const ADMIN_DIAGNOSTIC_SUMMARY_CHARS: usize = 180;
+
+fn truncate_admin_diagnostic_summary(value: &str) -> String {
+    let mut output = String::new();
+
+    for (index, ch) in value.chars().enumerate() {
+        if index >= ADMIN_DIAGNOSTIC_SUMMARY_CHARS {
+            output.push_str("...");
+            return output;
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn collapse_admin_diagnostic_text(value: &str) -> String {
+    let value = unwrap_admin_diagnostic_debug_string(value);
+    let value = value
+        .replace("\\r\\n", " ")
+        .replace("\\n", " ")
+        .replace("\\r", " ")
+        .replace("\\t", " ")
+        .replace(['\r', '\n', '\t'], " ");
+
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned()
+}
+
+fn unwrap_admin_diagnostic_debug_string(value: &str) -> String {
+    let mut current = value.trim().to_owned();
+
+    for _ in 0..3 {
+        let trimmed = current.trim();
+
+        if !(trimmed.starts_with("InternalStr(")
+            || trimmed.starts_with("InternalStrStatic(")
+            || trimmed.starts_with("Internal(Error("))
+        {
+            break;
+        }
+
+        let Some(first_quote) = trimmed.find('"') else {
+            break;
+        };
+        let Some(last_quote) = trimmed.rfind('"') else {
+            break;
+        };
+
+        if first_quote >= last_quote {
+            break;
+        }
+
+        let quoted = &trimmed[first_quote..=last_quote];
+        current = match serde_json::from_str::<String>(quoted) {
+            Ok(decoded) => decoded,
+            Err(_) => quoted.trim_matches('"').to_owned(),
+        };
+    }
+
+    current
+}
+
+fn admin_diagnostic_summary(value: &str) -> String {
+    let collapsed = collapse_admin_diagnostic_text(value);
+    let lower = collapsed.to_ascii_lowercase();
+
+    let summary = if lower.contains("domain_banned") || lower.contains("domain_blocked") {
+        "Remote reported an explicit domain block"
+    } else if lower.contains("domain") && lower.contains(" is blocked") {
+        "Remote returned generic domain-block text"
+    } else if lower.contains("fetch limit is > 50") {
+        "Remote fetch limit is lower than requested"
+    } else if lower.contains("remote request timed out")
+        || lower.contains("remote response timed out")
+        || lower.contains("timeout")
+    {
+        "Remote request timed out"
+    } else if lower.contains("certificate verify failed") {
+        "TLS certificate verification failed"
+    } else if lower.contains("dns lookup failed")
+        || lower.contains("dns error")
+        || lower.contains("failed to lookup address")
+        || lower.contains("failed to resolve")
+    {
+        "DNS lookup failed"
+    } else if lower.contains("502 bad gateway") {
+        "Remote returned 502 Bad Gateway"
+    } else if lower.contains("instance_is_private") || lower.contains("instance is private") {
+        "Instance is private"
+    } else if lower.contains("route not found") || lower.contains("not found") {
+        "Remote route not found"
+    } else if lower.contains("connection refused") {
+        "Remote connection refused"
+    } else if lower.contains("no route to host") {
+        "No route to host"
+    } else if lower.contains("anubis") || lower.contains("oh noes") {
+        "Remote returned a bot challenge page"
+    } else if lower.contains("forbidden") {
+        "Remote returned Forbidden"
+    } else if lower.contains("no eligible remote post") {
+        "No eligible remote post was available for probing"
+    } else if lower.contains("unknown")
+        && lower.contains("error in remote response")
+        && lower.contains("message")
+    {
+        if lower.contains("\"message\":\"\"") || lower.contains("\"message\": \"\"") {
+            "Remote returned an unknown error without a message"
+        } else {
+            "Remote returned an unknown error"
+        }
+    } else if lower.contains("eof while parsing a value") {
+        "Remote returned incomplete JSON"
+    } else if lower.contains("unknown content type found for activity") {
+        "Remote returned an unsupported ActivityPub content type"
+    } else {
+        return truncate_admin_diagnostic_summary(&collapsed);
+    };
+
+    summary.to_owned()
+}
+
+struct AdminDiagnostic<'a> {
+    value: Option<&'a str>,
+}
+
+impl render::Render for AdminDiagnostic<'_> {
+    fn render_into<W: std::fmt::Write + ?Sized>(self, w: &mut W) -> std::fmt::Result {
+        let Some(value) = self.value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+
+        let summary = admin_diagnostic_summary(value);
+        let collapsed = collapse_admin_diagnostic_text(value);
+
+        if collapsed == summary {
+            render::rsx! {
+                <span class={"adminDiagnosticText"}>{summary.as_str()}</span>
+            }
+            .render_into(w)
+        } else {
+            render::rsx! {
+                <details class={"adminDiagnostic"}>
+                    <summary>{summary.as_str()}</summary>
+                    <pre class={"adminDiagnosticRaw"}>{collapsed.as_str()}</pre>
+                </details>
+            }
+            .render_into(w)
+        }
+    }
+}
 
 async fn page_administration(
     _params: (),
@@ -45,14 +206,52 @@ async fn page_administration(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let api_res: RespInstanceInfo = serde_json::from_slice(&api_res)?;
+
+    let federation_res = res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::get(format!(
+                    "{}/api/unstable/instance/federation",
+                    ctx.backend_host,
+                ))
+                .body(Default::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+    let federation_res = crate::read_body_with_timeout(federation_res.into_body()).await?;
+    let federation_res: RespAdminFederationHealth = serde_json::from_slice(&federation_res)?;
 
     Ok(html_response(render::html! {
         <HTPage base_data={&base_data} lang={&lang} title={&title}>
             <h1>{title.as_ref()}</h1>
             <a href={"/administration/edit"}>{lang.tr(&lang::administration_edit())}</a>
             <ul>
+                <li>
+                    {"Site name: "}
+                    <strong>{api_res.site_name.as_ref()}</strong>
+                </li>
+                <li>
+                    {"Site logo: "}
+                    {
+                        api_res.site_logo.as_ref().map(|logo| {
+                            render::rsx! {
+                                <img src={safe_href(logo.url.as_ref()).unwrap_or("")} class={"siteLogoPreview"} alt={""} />
+                            }
+                        })
+                    }
+                    {
+                        api_res.site_logo.is_none().then_some({
+                            render::rsx! {
+                                <span>{"none"}</span>
+                            }
+                        })
+                    }
+                </li>
                 <li>
                     {
                         lang::TrElements::new(
@@ -117,7 +316,574 @@ async fn page_administration(
                         Some(_) => &lang::UNKNOWN,
                     })}</strong>
                 </li>
+                <li>
+                    {"Remote post purge: "}
+                    <strong>{lang.tr(if api_res.cleanup_remote_posts_enabled {
+                        &lang::ENABLED_TRUE
+                    } else {
+                        &lang::ENABLED_FALSE
+                    })}</strong>
+                    {" after "}
+                    <strong>{api_res.cleanup_remote_post_retention_days.to_string()}</strong>
+                    {" days"}
+                </li>
+                <li>
+                    {"Preview post cache purge: "}
+                    <strong>{lang.tr(if api_res.cleanup_preview_posts_enabled {
+                        &lang::ENABLED_TRUE
+                    } else {
+                        &lang::ENABLED_FALSE
+                    })}</strong>
+                    {" after "}
+                    <strong>{api_res.cleanup_preview_post_retention_hours.to_string()}</strong>
+                    {" hours"}
+                </li>
+                <li>
+                    {"Deleted remote community purge: "}
+                    <strong>{lang.tr(if api_res.cleanup_deleted_remote_communities_enabled {
+                        &lang::ENABLED_TRUE
+                    } else {
+                        &lang::ENABLED_FALSE
+                    })}</strong>
+                </li>
+                <li>
+                    {"Zero-follower remote community purge: "}
+                    <strong>{lang.tr(if api_res.cleanup_unfollowed_remote_communities_enabled {
+                        &lang::ENABLED_TRUE
+                    } else {
+                        &lang::ENABLED_FALSE
+                    })}</strong>
+                </li>
+                <li>
+                    {"Remote like cleanup: "}
+                    <strong>{lang.tr(if api_res.cleanup_remote_interactions_enabled {
+                        &lang::ENABLED_TRUE
+                    } else {
+                        &lang::ENABLED_FALSE
+                    })}</strong>
+                </li>
+                <li>
+                    {"Notification cleanup: "}
+                    <strong>{lang.tr(if api_res.cleanup_notifications_enabled {
+                        &lang::ENABLED_TRUE
+                    } else {
+                        &lang::ENABLED_FALSE
+                    })}</strong>
+                    {" after "}
+                    <strong>{api_res.cleanup_notification_retention_days.to_string()}</strong>
+                    {" days"}
+                </li>
+                <li>
+                    {"Failed inbox payload cleanup: "}
+                    <strong>{lang.tr(if api_res.cleanup_failed_inbox_task_payloads_enabled {
+                        &lang::ENABLED_TRUE
+                    } else {
+                        &lang::ENABLED_FALSE
+                    })}</strong>
+                    {" after "}
+                    <strong>{api_res.cleanup_failed_inbox_task_payload_retention_days.to_string()}</strong>
+                    {" days"}
+                </li>
             </ul>
+            <h2>{"Federation health"}</h2>
+            <ul>
+                <li>
+                    {"Known hosts: "}
+                    <strong>{federation_res.summary.discovery_servers_total.to_string()}</strong>
+                    {" total, "}
+                    <strong>{federation_res.summary.discovery_servers_active.to_string()}</strong>
+                    {" active, "}
+                    <strong>{federation_res.summary.discovery_servers_inactive.to_string()}</strong>
+                    {" inactive, "}
+                    <strong>{federation_res.summary.discovery_servers_suppressed.to_string()}</strong>
+                    {" suppressed"}
+                </li>
+                <li>
+                    {"Interaction probes: "}
+                    <strong>{federation_res.summary.discovery_servers_probe_success.to_string()}</strong>
+                    {" hosts have passed at least one empirical probe"}
+                </li>
+                <li>
+                    {"Discovered communities: "}
+                    <strong>{federation_res.summary.discovered_communities_total.to_string()}</strong>
+                    {" total, "}
+                    <strong>{federation_res.summary.discovered_communities_active.to_string()}</strong>
+                    {" active, "}
+                    <strong>{federation_res.summary.discovered_communities_with_posts.to_string()}</strong>
+                    {" active with posts"}
+                </li>
+                <li>
+                    {"Actor platform profiles: "}
+                    <strong>{federation_res.summary.actor_target_profiles_total.to_string()}</strong>
+                </li>
+                <li>
+                    {"Blocked AP ids: "}
+                    <strong>{federation_res.summary.blocked_ap_ids_total.to_string()}</strong>
+                </li>
+                <li>
+                    {"Hidden communities: "}
+                    <strong>{federation_res.summary.server_suppressed_communities_total.to_string()}</strong>
+                    {" server scoped, "}
+                    <strong>{federation_res.summary.user_suppressed_communities_total.to_string()}</strong>
+                    {" user scoped"}
+                </li>
+                <li>
+                    {"Federation events: "}
+                    <strong>{federation_res.summary.federation_events_total.to_string()}</strong>
+                </li>
+            </ul>
+            <h3>{"Recent federation events"}</h3>
+            <table class={"adminFederationTable"}>
+                <thead>
+                    <tr>
+                        <th>{"Time"}</th>
+                        <th>{"Direction"}</th>
+                        <th>{"Action"}</th>
+                        <th>{"Status"}</th>
+                        <th>{"Host"}</th>
+                        <th>{"Object"}</th>
+                        <th>{"Error"}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {
+                        if federation_res.recent_events.is_empty() {
+                            vec![render::rsx! {
+                                <tr>
+                                    <td>{""}</td>
+                                    <td>{"None"}</td>
+                                    <td>{""}</td>
+                                    <td>{""}</td>
+                                    <td>{""}</td>
+                                    <td><small>{""}</small></td>
+                                    <td><AdminDiagnostic value={None} /></td>
+                                </tr>
+                            }]
+                        } else {
+                            federation_res.recent_events.iter().map(|event| {
+                                let object = event.object_ap_id.as_deref()
+                                    .or(event.target_ap_id.as_deref())
+                                    .or(event.actor_ap_id.as_deref())
+                                    .unwrap_or("");
+                                let error = event.error_text.as_deref()
+                                    .or(event.error_class.as_deref());
+
+                                render::rsx! {
+                                    <tr>
+                                        <td>{event.created_at.as_str()}</td>
+                                        <td>{event.direction.as_str()}</td>
+                                        <td>{event.action.as_str()}</td>
+                                        <td>{event.status.as_str()}</td>
+                                        <td>{event.host.as_deref().unwrap_or("")}</td>
+                                        <td><small>{object}</small></td>
+                                        <td><AdminDiagnostic value={error} /></td>
+                                    </tr>
+                                }
+                            }).collect::<Vec<_>>()
+                        }
+                    }
+                </tbody>
+            </table>
+            <h3>{"Replayable failed tasks"}</h3>
+            <table class={"adminFederationTable"}>
+                <thead>
+                    <tr>
+                        <th>{"Task"}</th>
+                        <th>{"Kind"}</th>
+                        <th>{"Attempts"}</th>
+                        <th>{"Attempted"}</th>
+                        <th>{"Error"}</th>
+                        <th>{"Action"}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {
+                        if federation_res.replayable_failed_tasks.is_empty() {
+                            vec![render::rsx! {
+                                <tr>
+                                    <td>{"None".to_owned()}</td>
+                                    <td>{""}</td>
+                                    <td>{String::new()}</td>
+                                    <td>{""}</td>
+                                    <td><AdminDiagnostic value={None} /></td>
+                                    <td>
+                                        <form method={"POST"} action={String::new()}>
+                                            <button type={"submit"}>{""}</button>
+                                        </form>
+                                    </td>
+                                </tr>
+                            }]
+                        } else {
+                            federation_res.replayable_failed_tasks.iter().map(|task| {
+                                let action = format!("/administration/federation/tasks/{}/retry", task.id);
+
+                                render::rsx! {
+                                    <tr>
+                                        <td>{task.id.to_string()}</td>
+                                        <td>{task.kind.as_str()}</td>
+                                        <td>{format!("{}/{}", task.attempts, task.max_attempts)}</td>
+                                        <td>{task.attempted_at.as_deref().unwrap_or(task.created_at.as_str())}</td>
+                                        <td><AdminDiagnostic value={task.latest_error.as_deref()} /></td>
+                                        <td>
+                                            <form method={"POST"} action={action}>
+                                                <button type={"submit"}>{"Retry"}</button>
+                                            </form>
+                                        </td>
+                                    </tr>
+                                }
+                            }).collect::<Vec<_>>()
+                        }
+                    }
+                </tbody>
+            </table>
+            <h3>{"Host capability profiles"}</h3>
+            <table class={"adminFederationTable"}>
+                <thead>
+                    <tr>
+                        <th>{"Host"}</th>
+                        <th>{"Software"}</th>
+                        <th>{"Health"}</th>
+                        <th>{"Communities"}</th>
+                        <th>{"Actor profiles"}</th>
+                        <th>{"Recent events"}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {
+                        if federation_res.host_profiles.is_empty() {
+                            vec![render::rsx! {
+                                <tr>
+                                    <td>{"None"}</td>
+                                    <td>{""}</td>
+                                    <td>
+                                        {"inactive"}
+                                        {"; "}
+                                        {String::new()}
+                                        {" failures"}
+                                        <br />
+                                        <AdminDiagnostic value={None} />
+                                    </td>
+                                    <td>{String::new()}</td>
+                                    <td>{String::new()}</td>
+                                    <td>{String::new()}</td>
+                                </tr>
+                            }]
+                        } else {
+                            federation_res.host_profiles.iter().map(|profile| {
+                                let health = profile.suppressed_reason.as_deref()
+                                    .or(profile.interaction_probe_latest_error.as_deref())
+                                    .or(profile.latest_error.as_deref());
+                                let communities = format!(
+                                    "{} stored, {} followed, {} discovered active with posts",
+                                    profile.communities_total,
+                                    profile.followed_communities_total,
+                                    profile.discovered_communities_with_posts,
+                                );
+                                let actors = format!(
+                                    "{} total, {} high confidence",
+                                    profile.actor_profiles_total,
+                                    profile.high_confidence_actor_profiles_total,
+                                );
+                                let events = format!(
+                                    "{} total, {} failed",
+                                    profile.recent_events_total,
+                                    profile.recent_failures_total,
+                                );
+
+                                render::rsx! {
+                                    <tr>
+                                        <td>{profile.host.as_str()}</td>
+                                        <td>{profile.software.as_deref().unwrap_or("")}</td>
+                                        <td>
+                                            {if profile.active { "active" } else { "inactive" }}
+                                            {"; "}
+                                            {profile.failed_checks.to_string()}
+                                            {" failures"}
+                                            <br />
+                                            <AdminDiagnostic value={health} />
+                                        </td>
+                                        <td>{communities}</td>
+                                        <td>{actors}</td>
+                                        <td>{events}</td>
+                                    </tr>
+                                }
+                            }).collect::<Vec<_>>()
+                        }
+                    }
+                </tbody>
+            </table>
+            <h3>{"Suppressed hosts"}</h3>
+            <table class={"adminFederationTable"}>
+                <thead>
+                    <tr>
+                        <th>{"Host"}</th>
+                        <th>{"Software"}</th>
+                        <th>{"Reason"}</th>
+                        <th>{"Probe error"}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {
+                        if federation_res.suppressed_servers.is_empty() {
+                            vec![render::rsx! {
+                                <tr>
+                                    <td>{"None"}</td>
+                                    <td>{""}</td>
+                                    <td><AdminDiagnostic value={None} /></td>
+                                    <td><AdminDiagnostic value={None} /></td>
+                                </tr>
+                            }]
+                        } else {
+                            federation_res.suppressed_servers.iter().map(|server| {
+                                render::rsx! {
+                                    <tr>
+                                        <td>{server.host.as_str()}</td>
+                                        <td>{server.software.as_deref().unwrap_or("")}</td>
+                                        <td>
+                                            <AdminDiagnostic value={server.suppressed_reason.as_deref()} />
+                                        </td>
+                                        <td>
+                                            <AdminDiagnostic value={server.interaction_probe_latest_error.as_deref()} />
+                                        </td>
+                                    </tr>
+                                }
+                            }).collect::<Vec<_>>()
+                        }
+                    }
+                </tbody>
+            </table>
+            <h3>{"Failing hosts"}</h3>
+            <table class={"adminFederationTable"}>
+                <thead>
+                    <tr>
+                        <th>{"Host"}</th>
+                        <th>{"Software"}</th>
+                        <th>{"Active"}</th>
+                        <th>{"Failures"}</th>
+                        <th>{"Latest error"}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {
+                        if federation_res.failing_servers.is_empty() {
+                            vec![render::rsx! {
+                                <tr>
+                                    <td>{"None"}</td>
+                                    <td>{""}</td>
+                                    <td>{""}</td>
+                                    <td>{String::new()}</td>
+                                    <td><AdminDiagnostic value={None} /></td>
+                                </tr>
+                            }]
+                        } else {
+                            federation_res.failing_servers.iter().map(|server| {
+                                render::rsx! {
+                                    <tr>
+                                        <td>{server.host.as_str()}</td>
+                                        <td>{server.software.as_deref().unwrap_or("")}</td>
+                                        <td>{if server.active { "yes" } else { "no" }}</td>
+                                        <td>{server.failed_checks.to_string()}</td>
+                                        <td>
+                                            <AdminDiagnostic value={server.latest_error.as_deref()
+                                                .or(server.interaction_probe_latest_error.as_deref())} />
+                                        </td>
+                                    </tr>
+                                }
+                            }).collect::<Vec<_>>()
+                        }
+                    }
+                </tbody>
+            </table>
+            <h3>{"Blocked AP ids"}</h3>
+            <ul>
+                {
+                    if federation_res.blocked_ap_ids.is_empty() {
+                        vec![render::rsx! {
+                            <li>{"None"}</li>
+                        }]
+                    } else {
+                        federation_res.blocked_ap_ids.iter().map(|blocked| {
+                            render::rsx! {
+                                <li>{blocked.ap_id.as_str()}</li>
+                            }
+                        }).collect::<Vec<_>>()
+                    }
+                }
+            </ul>
+            <h3>{"Suppressed communities"}</h3>
+            <table class={"adminFederationTable"}>
+                <thead>
+                    <tr>
+                        <th>{"Scope"}</th>
+                        <th>{"Community"}</th>
+                        <th>{"User"}</th>
+                        <th>{"Reason"}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {
+                        if federation_res.server_suppressed_communities.is_empty()
+                            && federation_res.user_suppressed_communities.is_empty()
+                        {
+                            vec![render::rsx! {
+                                <tr>
+                                    <td>{"None"}</td>
+                                    <td>{""}{" "}<small>{""}</small></td>
+                                    <td>{""}{" "}<small>{""}</small></td>
+                                    <td><AdminDiagnostic value={None} /></td>
+                                </tr>
+                            }]
+                        } else {
+                            let mut rows = Vec::new();
+
+                            rows.extend(federation_res.server_suppressed_communities.iter().map(|community| {
+                                render::rsx! {
+                                    <tr>
+                                        <td>{"server"}</td>
+                                        <td>
+                                            {community.community_name.as_str()}
+                                            {" "}
+                                            <small>{community.community_ap_id.as_deref().unwrap_or("")}</small>
+                                        </td>
+                                        <td>{""}{" "}<small>{""}</small></td>
+                                        <td>
+                                            <AdminDiagnostic value={Some(community.reason.as_str())} />
+                                        </td>
+                                    </tr>
+                                }
+                            }));
+
+                            rows.extend(federation_res.user_suppressed_communities.iter().map(|community| {
+                                render::rsx! {
+                                    <tr>
+                                        <td>{"user"}</td>
+                                        <td>
+                                            {community.community_name.as_str()}
+                                            {" "}
+                                            <small>{community.community_ap_id.as_deref().unwrap_or("")}</small>
+                                        </td>
+                                        <td>
+                                            {community.username.as_str()}
+                                            {" "}
+                                            <small>{community.person_ap_id.as_deref().unwrap_or("")}</small>
+                                        </td>
+                                        <td>
+                                            <AdminDiagnostic value={Some(community.reason.as_str())} />
+                                        </td>
+                                    </tr>
+                                }
+                            }));
+
+                            rows
+                        }
+                    }
+                </tbody>
+            </table>
+            <h3>{"Actor platform profiles"}</h3>
+            <table class={"adminFederationTable"}>
+                <thead>
+                    <tr>
+                        <th>{"Family"}</th>
+                        <th>{"Target"}</th>
+                        <th>{"Actor kind"}</th>
+                        <th>{"Count"}</th>
+                        <th>{"High confidence"}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {
+                        if federation_res.actor_profile_families.is_empty() {
+                            vec![render::rsx! {
+                                <tr>
+                                    <td>{"None"}</td>
+                                    <td>{""}</td>
+                                    <td>{""}</td>
+                                    <td>{String::new()}</td>
+                                    <td>{String::new()}</td>
+                                </tr>
+                            }]
+                        } else {
+                            federation_res.actor_profile_families.iter().map(|family| {
+                                render::rsx! {
+                                    <tr>
+                                        <td>{family.family.as_str()}</td>
+                                        <td>{family.target.as_str()}</td>
+                                        <td>{family.actor_kind.as_str()}</td>
+                                        <td>{family.count.to_string()}</td>
+                                        <td>{family.high_confidence_count.to_string()}</td>
+                                    </tr>
+                                }
+                            }).collect::<Vec<_>>()
+                        }
+                    }
+                </tbody>
+            </table>
+            <h3>{"Recent actor profiles"}</h3>
+            <table class={"adminFederationTable"}>
+                <thead>
+                    <tr>
+                        <th>{"Actor"}</th>
+                        <th>{"Family"}</th>
+                        <th>{"Target"}</th>
+                        <th>{"Confidence"}</th>
+                        <th>{"Endpoints"}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {
+                        if federation_res.recent_actor_profiles.is_empty() {
+                            vec![render::rsx! {
+                                <tr>
+                                    <td>{"None"}</td>
+                                    <td>{""}</td>
+                                    <td>{""}</td>
+                                    <td>{String::new()}</td>
+                                    <td>{String::new()}</td>
+                                </tr>
+                            }]
+                        } else {
+                            federation_res.recent_actor_profiles.iter().map(|profile| {
+                                let endpoints = [
+                                    if profile.has_inbox {
+                                        Some("inbox")
+                                    } else {
+                                        None
+                                    },
+                                    if profile.has_outbox {
+                                        Some("outbox")
+                                    } else {
+                                        None
+                                    },
+                                    if profile.has_followers {
+                                        Some("followers")
+                                    } else {
+                                        None
+                                    },
+                                    if profile.has_featured {
+                                        Some("featured")
+                                    } else {
+                                        None
+                                    },
+                                ]
+                                    .into_iter()
+                                    .flatten()
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+
+                                render::rsx! {
+                                    <tr>
+                                        <td>{profile.actor_ap_id.as_str()}</td>
+                                        <td>{profile.family.as_str()}</td>
+                                        <td>{profile.target.as_str()}</td>
+                                        <td>{profile.confidence.to_string()}</td>
+                                        <td>{endpoints}</td>
+                                    </tr>
+                                }
+                            }).collect::<Vec<_>>()
+                        }
+                    }
+                </tbody>
+            </table>
         </HTPage>
     }))
 }
@@ -166,7 +932,7 @@ async fn page_administration_edit_inner(
             .await?,
     )
     .await?;
-    let api_res = hyper::body::to_bytes(api_res.into_body()).await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
     let api_res: RespInstanceInfo = serde_json::from_slice(&api_res)?;
 
     let signup_allowed_value = Some(crate::bool_as_str(api_res.signup_allowed));
@@ -183,6 +949,13 @@ async fn page_administration_edit_inner(
             .as_deref()
             .unwrap_or(""),
     );
+    let site_name_value = Some(api_res.site_name.as_ref());
+    let remote_post_retention_days = api_res.cleanup_remote_post_retention_days.to_string();
+    let preview_post_retention_hours = api_res.cleanup_preview_post_retention_hours.to_string();
+    let notification_retention_days = api_res.cleanup_notification_retention_days.to_string();
+    let failed_inbox_payload_retention_days = api_res
+        .cleanup_failed_inbox_task_payload_retention_days
+        .to_string();
 
     let (description_content, description_format) = match api_res.description.content_markdown {
         Some(content) => (content, "markdown"),
@@ -202,7 +975,81 @@ async fn page_administration_edit_inner(
                     }
                 })
             }
+            <form method={"POST"} action={"/administration/edit/logo"} enctype={"multipart/form-data"}>
+                <fieldset>
+                    <legend>{"Logo"}</legend>
+                    {
+                        api_res.site_logo.as_ref().map(|logo| {
+                            render::rsx! {
+                                <div>
+                                    <img src={safe_href(logo.url.as_ref()).unwrap_or("")} class={"siteLogoPreview"} alt={""} />
+                                </div>
+                            }
+                        })
+                    }
+                    <div>
+                        <label>
+                            {"Site logo"}<br />
+                            <input type={"file"} name={"site_logo_media"} accept={"image/*"} />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            <input type={"checkbox"} name={"remove_site_logo"} />
+                            {" Remove logo"}
+                        </label>
+                    </div>
+                    <button type={"submit"}>{"Upload logo"}</button>
+                </fieldset>
+            </form>
+            <form method={"POST"} action={"/administration/edit/stylesheet"} enctype={"multipart/form-data"}>
+                <fieldset>
+                    <legend>{"Stylesheet"}</legend>
+                    {
+                        api_res.site_css.as_ref().map(|css| {
+                            render::rsx! {
+                                <p>
+                                    {"Custom CSS is active: "}
+                                    <a href={safe_href(css.url.as_ref()).unwrap_or("")}>{"view stylesheet"}</a>
+                                </p>
+                            }
+                        })
+                    }
+                    {
+                        api_res.site_css.is_none().then_some({
+                            render::rsx! {
+                                <p>{"Using bundled CSS."}</p>
+                            }
+                        })
+                    }
+                    <div>
+                        <label>
+                            {"Site CSS"}<br />
+                            <input type={"file"} name={"site_css_media"} accept={"text/css,.css"} />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            <input type={"checkbox"} name={"remove_site_css"} />
+                            {" Remove custom CSS"}
+                        </label>
+                    </div>
+                    <button type={"submit"}>{"Upload CSS"}</button>
+                </fieldset>
+            </form>
             <form method={"POST"} action={"/administration/edit/submit"}>
+                <div>
+                    <label>
+                        {"Site name"}<br />
+                        <input
+                            type={"text"}
+                            name={"site_name"}
+                            value={maybe_fill_value(&prev_values, "site_name", site_name_value)}
+                            maxlength={"80"}
+                            required={""}
+                        />
+                    </label>
+                </div>
                 <div>
                     <label>
                         {lang.tr(&lang::administration_edit_signup_allowed())}<br />
@@ -255,6 +1102,138 @@ async fn page_administration_edit_inner(
                         </select>
                     </label>
                 </div>
+                <fieldset>
+                    <legend>{"Cleanup jobs"}</legend>
+                    <div>
+                        <label>
+                            <MaybeFillCheckbox
+                                values={&prev_values}
+                                name={"cleanup_remote_posts_enabled"}
+                                id={"cleanup_remote_posts_enabled"}
+                                default={api_res.cleanup_remote_posts_enabled}
+                            />
+                            {" Purge old remote posts and deleted remote posts"}
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            {"Remote post retention days"}<br />
+                            <input
+                                type={"number"}
+                                name={"cleanup_remote_post_retention_days"}
+                                value={maybe_fill_value(&prev_values, "cleanup_remote_post_retention_days", Some(remote_post_retention_days.as_str()))}
+                                min={"1"}
+                                max={"3650"}
+                                required={""}
+                            />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            <MaybeFillCheckbox
+                                values={&prev_values}
+                                name={"cleanup_preview_posts_enabled"}
+                                id={"cleanup_preview_posts_enabled"}
+                                default={api_res.cleanup_preview_posts_enabled}
+                            />
+                            {" Purge unfollowed preview posts"}
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            {"Preview post retention hours"}<br />
+                            <input
+                                type={"number"}
+                                name={"cleanup_preview_post_retention_hours"}
+                                value={maybe_fill_value(&prev_values, "cleanup_preview_post_retention_hours", Some(preview_post_retention_hours.as_str()))}
+                                min={"1"}
+                                max={"720"}
+                                required={""}
+                            />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            <MaybeFillCheckbox
+                                values={&prev_values}
+                                name={"cleanup_deleted_remote_communities_enabled"}
+                                id={"cleanup_deleted_remote_communities_enabled"}
+                                default={api_res.cleanup_deleted_remote_communities_enabled}
+                            />
+                            {" Delete empty remote communities marked deleted"}
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            <MaybeFillCheckbox
+                                values={&prev_values}
+                                name={"cleanup_unfollowed_remote_communities_enabled"}
+                                id={"cleanup_unfollowed_remote_communities_enabled"}
+                                default={api_res.cleanup_unfollowed_remote_communities_enabled}
+                            />
+                            {" Delete empty remote communities with no local followers"}
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            <MaybeFillCheckbox
+                                values={&prev_values}
+                                name={"cleanup_remote_interactions_enabled"}
+                                id={"cleanup_remote_interactions_enabled"}
+                                default={api_res.cleanup_remote_interactions_enabled}
+                            />
+                            {" Purge old remote likes on purgeable remote posts and comments"}
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            <MaybeFillCheckbox
+                                values={&prev_values}
+                                name={"cleanup_notifications_enabled"}
+                                id={"cleanup_notifications_enabled"}
+                                default={api_res.cleanup_notifications_enabled}
+                            />
+                            {" Purge old read notifications"}
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            {"Notification retention days"}<br />
+                            <input
+                                type={"number"}
+                                name={"cleanup_notification_retention_days"}
+                                value={maybe_fill_value(&prev_values, "cleanup_notification_retention_days", Some(notification_retention_days.as_str()))}
+                                min={"1"}
+                                max={"3650"}
+                                required={""}
+                            />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            <MaybeFillCheckbox
+                                values={&prev_values}
+                                name={"cleanup_failed_inbox_task_payloads_enabled"}
+                                id={"cleanup_failed_inbox_task_payloads_enabled"}
+                                default={api_res.cleanup_failed_inbox_task_payloads_enabled}
+                            />
+                            {" Discard failed inbox task payloads after permanent failure"}
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            {"Failed inbox task retention days"}<br />
+                            <input
+                                type={"number"}
+                                name={"cleanup_failed_inbox_task_payload_retention_days"}
+                                value={maybe_fill_value(&prev_values, "cleanup_failed_inbox_task_payload_retention_days", Some(failed_inbox_payload_retention_days.as_str()))}
+                                min={"1"}
+                                max={"365"}
+                                required={""}
+                            />
+                        </label>
+                    </div>
+                </fieldset>
                 <label>
                     {lang.tr(&lang::description())}
                     <br />
@@ -280,6 +1259,313 @@ async fn page_administration_edit_inner(
     }))
 }
 
+async fn patch_instance_from_admin(
+    ctx: &crate::RouteContext,
+    headers: &hyper::header::HeaderMap,
+    cookies: &CookieMap<'_>,
+    body: serde_json::Value,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::patch(format!("{}/api/unstable/instance", ctx.backend_host))
+                    .body(serde_json::to_vec(&body)?.into())?,
+                headers,
+                cookies,
+            )?)
+            .await?,
+    )
+    .await
+}
+
+async fn handler_administration_logo_submit(
+    _params: (),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (req_parts, body) = req.into_parts();
+
+    let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
+
+    let content_type = req_parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .ok_or_else(|| {
+            crate::Error::InternalStr("missing content-type header in form submission".to_owned())
+        })?;
+    let content_type = std::str::from_utf8(content_type.as_ref())?;
+    let boundary = multer::parse_boundary(content_type)?;
+
+    let mut multipart = multer::Multipart::new(body, boundary);
+    let mut remove_site_logo = false;
+    let mut site_logo = None;
+
+    loop {
+        let field = multipart.next_field().await?;
+        let field = match field {
+            None => break,
+            Some(field) => field,
+        };
+
+        let field_name = match field.name() {
+            None => continue,
+            Some(name) => name.to_owned(),
+        };
+
+        if field_name == "remove_site_logo" {
+            remove_site_logo = true;
+            continue;
+        }
+
+        if field_name == "site_logo_media" {
+            use futures_util::StreamExt;
+
+            let mut stream = field.peekable();
+            let first_chunk = std::pin::Pin::new(&mut stream).peek().await;
+            let is_empty = match first_chunk {
+                None => true,
+                Some(Ok(chunk)) => chunk.is_empty(),
+                Some(Err(err)) => {
+                    return Err(crate::Error::InternalStr(format!(
+                        "failed parsing form: {err:?}"
+                    )));
+                }
+            };
+
+            if is_empty {
+                continue;
+            }
+
+            let mime = match stream.get_ref().content_type() {
+                None => {
+                    return page_administration_edit_inner(
+                        &req_parts.headers,
+                        &cookies,
+                        ctx,
+                        Some("Missing Content-Type for logo upload".to_owned()),
+                        None,
+                    )
+                    .await;
+                }
+                Some(mime) => mime,
+            };
+
+            let res = res_to_error(
+                ctx.http_client
+                    .request(for_client(
+                        hyper::Request::post(format!("{}/api/unstable/media", ctx.backend_host))
+                            .header(hyper::header::CONTENT_TYPE, mime.as_ref())
+                            .body(hyper::Body::wrap_stream(stream))?,
+                        &req_parts.headers,
+                        &cookies,
+                    )?)
+                    .await?,
+            )
+            .await;
+
+            match res {
+                Err(crate::Error::RemoteError((_, message))) => {
+                    return page_administration_edit_inner(
+                        &req_parts.headers,
+                        &cookies,
+                        ctx,
+                        Some(message),
+                        None,
+                    )
+                    .await;
+                }
+                Err(other) => return Err(other),
+                Ok(res) => {
+                    let res = crate::read_body_with_timeout(res.into_body()).await?;
+                    let res: JustStringID = serde_json::from_slice(&res)?;
+
+                    site_logo = Some(format!("local-media://{}", res.id));
+                }
+            }
+        }
+    }
+
+    let body = if remove_site_logo {
+        serde_json::json!({ "site_logo": null })
+    } else if let Some(site_logo) = site_logo {
+        serde_json::json!({ "site_logo": site_logo })
+    } else {
+        return page_administration_edit_inner(
+            &req_parts.headers,
+            &cookies,
+            ctx,
+            Some("Choose a logo image to upload".to_owned()),
+            None,
+        )
+        .await;
+    };
+
+    match patch_instance_from_admin(&ctx, &req_parts.headers, &cookies, body).await {
+        Err(crate::Error::RemoteError((_, message))) => {
+            page_administration_edit_inner(&req_parts.headers, &cookies, ctx, Some(message), None)
+                .await
+        }
+        Err(other) => Err(other),
+        Ok(_) => Ok(hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, "/administration/edit")
+            .body("Successfully edited.".into())?),
+    }
+}
+
+async fn handler_administration_stylesheet_submit(
+    _params: (),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (req_parts, body) = req.into_parts();
+
+    let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
+
+    let content_type = req_parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .ok_or_else(|| {
+            crate::Error::InternalStr("missing content-type header in form submission".to_owned())
+        })?;
+    let content_type = std::str::from_utf8(content_type.as_ref())?;
+    let boundary = multer::parse_boundary(content_type)?;
+
+    let mut multipart = multer::Multipart::new(body, boundary);
+    let mut remove_site_css = false;
+    let mut uploaded = false;
+
+    loop {
+        let field = multipart.next_field().await?;
+        let field = match field {
+            None => break,
+            Some(field) => field,
+        };
+
+        let field_name = match field.name() {
+            None => continue,
+            Some(name) => name.to_owned(),
+        };
+
+        if field_name == "remove_site_css" {
+            remove_site_css = true;
+            continue;
+        }
+
+        if field_name == "site_css_media" {
+            use futures_util::StreamExt;
+
+            let mut stream = field.peekable();
+            let first_chunk = std::pin::Pin::new(&mut stream).peek().await;
+            let is_empty = match first_chunk {
+                None => true,
+                Some(Ok(chunk)) => chunk.is_empty(),
+                Some(Err(err)) => {
+                    return Err(crate::Error::InternalStr(format!(
+                        "failed parsing form: {err:?}"
+                    )));
+                }
+            };
+
+            if is_empty {
+                continue;
+            }
+
+            let mime = match stream.get_ref().content_type() {
+                None => {
+                    return page_administration_edit_inner(
+                        &req_parts.headers,
+                        &cookies,
+                        ctx,
+                        Some("Missing Content-Type for CSS upload".to_owned()),
+                        None,
+                    )
+                    .await;
+                }
+                Some(mime) => mime,
+            };
+
+            let res = res_to_error(
+                ctx.http_client
+                    .request(for_client(
+                        hyper::Request::post(format!(
+                            "{}/api/unstable/instance/stylesheet",
+                            ctx.backend_host,
+                        ))
+                        .header(hyper::header::CONTENT_TYPE, mime.as_ref())
+                        .body(hyper::Body::wrap_stream(stream))?,
+                        &req_parts.headers,
+                        &cookies,
+                    )?)
+                    .await?,
+            )
+            .await;
+
+            match res {
+                Err(crate::Error::RemoteError((_, message))) => {
+                    return page_administration_edit_inner(
+                        &req_parts.headers,
+                        &cookies,
+                        ctx,
+                        Some(message),
+                        None,
+                    )
+                    .await;
+                }
+                Err(other) => return Err(other),
+                Ok(_) => {
+                    uploaded = true;
+                }
+            }
+        }
+    }
+
+    if remove_site_css {
+        match res_to_error(
+            ctx.http_client
+                .request(for_client(
+                    hyper::Request::delete(format!(
+                        "{}/api/unstable/instance/stylesheet",
+                        ctx.backend_host,
+                    ))
+                    .body(Default::default())?,
+                    &req_parts.headers,
+                    &cookies,
+                )?)
+                .await?,
+        )
+        .await
+        {
+            Err(crate::Error::RemoteError((_, message))) => {
+                return page_administration_edit_inner(
+                    &req_parts.headers,
+                    &cookies,
+                    ctx,
+                    Some(message),
+                    None,
+                )
+                .await;
+            }
+            Err(other) => return Err(other),
+            Ok(_) => {}
+        }
+    } else if !uploaded {
+        return page_administration_edit_inner(
+            &req_parts.headers,
+            &cookies,
+            ctx,
+            Some("Choose a CSS file to upload".to_owned()),
+            None,
+        )
+        .await;
+    }
+
+    Ok(hyper::Response::builder()
+        .status(hyper::StatusCode::SEE_OTHER)
+        .header(hyper::header::LOCATION, "/administration/edit")
+        .body("Successfully edited.".into())?)
+}
+
 async fn handler_administration_edit_submit(
     _params: (),
     ctx: Arc<crate::RouteContext>,
@@ -289,7 +1575,7 @@ async fn handler_administration_edit_submit(
 
     let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
 
-    let body = hyper::body::to_bytes(body).await?;
+    let body = crate::read_body_with_timeout(body).await?;
     let body_original: HashMap<Cow<'_, str>, serde_json::Value> =
         serde_urlencoded::from_bytes(&body)?;
     let mut body = body_original.clone();
@@ -304,6 +1590,55 @@ async fn handler_administration_edit_submit(
                 ))?
                 .parse()?,
         );
+    }
+
+    for key in [
+        "cleanup_remote_posts_enabled",
+        "cleanup_preview_posts_enabled",
+        "cleanup_deleted_remote_communities_enabled",
+        "cleanup_unfollowed_remote_communities_enabled",
+        "cleanup_remote_interactions_enabled",
+        "cleanup_notifications_enabled",
+        "cleanup_failed_inbox_task_payloads_enabled",
+    ] {
+        body.insert(key.into(), body_original.contains_key(key).into());
+    }
+
+    for key in [
+        "cleanup_remote_post_retention_days",
+        "cleanup_preview_post_retention_hours",
+        "cleanup_notification_retention_days",
+        "cleanup_failed_inbox_task_payload_retention_days",
+    ] {
+        let value = match body.get(key).and_then(|x| x.as_str()) {
+            Some(value) => value,
+            None => {
+                return page_administration_edit_inner(
+                    &req_parts.headers,
+                    &cookies,
+                    ctx,
+                    Some(format!("Missing numeric value for {key}")),
+                    Some(&body_original),
+                )
+                .await;
+            }
+        };
+
+        let value: i32 = match value.parse() {
+            Ok(value) => value,
+            Err(_) => {
+                return page_administration_edit_inner(
+                    &req_parts.headers,
+                    &cookies,
+                    ctx,
+                    Some(format!("Invalid numeric value for {key}")),
+                    Some(&body_original),
+                )
+                .await;
+            }
+        };
+
+        body.insert(key.into(), value.into());
     }
 
     for key in [
@@ -326,17 +1661,17 @@ async fn handler_administration_edit_submit(
             None => {
                 return Err(crate::Error::InternalStrStatic(
                     "Invalid or missing description format",
-                ))
+                ));
             }
         };
 
-        body.insert(format!("description_{}", format).into(), content.into());
+        body.insert(format!("description_{format}").into(), content.into());
     }
 
     let api_res = res_to_error(
         ctx.http_client
             .request(for_client(
-                hyper::Request::patch(format!("{}/api/unstable/instance", ctx.backend_host,))
+                hyper::Request::patch(format!("{}/api/unstable/instance", ctx.backend_host))
                     .body(serde_json::to_vec(&body)?.into())?,
                 &req_parts.headers,
                 &cookies,
@@ -364,6 +1699,35 @@ async fn handler_administration_edit_submit(
     }
 }
 
+async fn handler_administration_federation_task_retry(
+    params: (i64,),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (task_id,) = params;
+    let cookies = get_cookie_map_for_req(&req)?;
+
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::post(format!(
+                    "{}/api/unstable/instance/federation/tasks/{}/retry",
+                    ctx.backend_host, task_id
+                ))
+                .body(Default::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+
+    Ok(hyper::Response::builder()
+        .status(hyper::StatusCode::SEE_OTHER)
+        .header(hyper::header::LOCATION, "/administration")
+        .body("Task queued.".into())?)
+}
+
 pub fn route_administration() -> crate::RouteNode<()> {
     crate::RouteNode::new()
         .with_handler_async(hyper::Method::GET, page_administration)
@@ -372,6 +1736,20 @@ pub fn route_administration() -> crate::RouteNode<()> {
             crate::RouteNode::new()
                 .with_handler_async(hyper::Method::GET, page_administration_edit)
                 .with_child(
+                    "logo",
+                    crate::RouteNode::new().with_handler_async(
+                        hyper::Method::POST,
+                        handler_administration_logo_submit,
+                    ),
+                )
+                .with_child(
+                    "stylesheet",
+                    crate::RouteNode::new().with_handler_async(
+                        hyper::Method::POST,
+                        handler_administration_stylesheet_submit,
+                    ),
+                )
+                .with_child(
                     "submit",
                     crate::RouteNode::new().with_handler_async(
                         hyper::Method::POST,
@@ -379,4 +1757,90 @@ pub fn route_administration() -> crate::RouteNode<()> {
                     ),
                 ),
         )
+        .with_child(
+            "federation",
+            crate::RouteNode::new().with_child("tasks", {
+                crate::RouteNode::new().with_child_parse::<i64, _>(
+                    crate::RouteNode::new().with_child(
+                        "retry",
+                        crate::RouteNode::new().with_handler_async(
+                            hyper::Method::POST,
+                            handler_administration_federation_task_retry,
+                        ),
+                    ),
+                )
+            }),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn admin_diagnostic_summary_identifies_common_remote_failures() {
+        assert_eq!(
+            super::admin_diagnostic_summary(
+                "InternalStr(\"Error in remote response: {\\\"error\\\":\\\"unknown\\\",\\\"message\\\":\\\"Domain \\\\\\\"blocked.example\\\\\\\" is blocked\\\"}\")"
+            ),
+            "Remote returned generic domain-block text"
+        );
+        assert_eq!(
+            super::admin_diagnostic_summary(
+                "InternalStr(\"Error in remote response: {\\\"error\\\":\\\"domain_banned\\\"}\")"
+            ),
+            "Remote reported an explicit domain block"
+        );
+        assert_eq!(
+            super::admin_diagnostic_summary("InternalStr(\"Error in remote response: Forbidden\")"),
+            "Remote returned Forbidden"
+        );
+        assert_eq!(
+            super::admin_diagnostic_summary("InternalStrStatic(\"Remote request timed out\")"),
+            "Remote request timed out"
+        );
+        assert_eq!(
+            super::admin_diagnostic_summary(
+                "InternalStr(\"Error in remote response: {\\\"error\\\":\\\"unknown\\\",\\\"message\\\":\\\"\\\"}\")"
+            ),
+            "Remote returned an unknown error without a message"
+        );
+        assert_eq!(
+            super::admin_diagnostic_summary(
+                "InternalStr(\"lemmy-compatible failed: EOF while parsing a value\")"
+            ),
+            "Remote returned incomplete JSON"
+        );
+        assert_eq!(
+            super::admin_diagnostic_summary("InternalStrStatic(\"DNS lookup failed\")"),
+            "DNS lookup failed"
+        );
+        assert_eq!(
+            super::admin_diagnostic_summary("<html><title>Oh noes!</title>Anubis</html>"),
+            "Remote returned a bot challenge page"
+        );
+    }
+
+    #[test]
+    fn admin_diagnostic_summary_collapses_escaped_newlines() {
+        assert_eq!(
+            super::collapse_admin_diagnostic_text(
+                "InternalStr(\"line one\\r\\nline two\")\nline three"
+            ),
+            "line one line two"
+        );
+        assert_eq!(
+            super::collapse_admin_diagnostic_text(
+                "Internal(Error(\"data did not match any variant\"))"
+            ),
+            "data did not match any variant"
+        );
+    }
+
+    #[test]
+    fn admin_diagnostic_summary_truncates_unknown_long_messages() {
+        let long = "x".repeat(super::ADMIN_DIAGNOSTIC_SUMMARY_CHARS + 20);
+        let summary = super::admin_diagnostic_summary(&long);
+
+        assert!(summary.ends_with("..."));
+        assert!(summary.len() < long.len());
+    }
 }

@@ -264,3 +264,4 @@ post_site_block_question = Bloki ĉi tiun poŝton de la retejo?
 post_site_block_question_description = Forigos la lokan kopion de ĉi tiu poŝto kaj blokos reŝarĝadon de ĝi.
 site_block = bloki de retejo
 site_block_yes = Jes, bloki
+notification_user_follow = { $user } sekvas vin.

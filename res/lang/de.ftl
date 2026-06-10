@@ -158,3 +158,4 @@ view_more_comments = Zeite mehr Kommentare
 your_note = Persönliche Notiz
 your_note_add = Persönliche Notiz hinzufügen
 your_note_edit = Persönliche Notiz bearbeiten
+notification_user_follow = { $user } folgt dir.

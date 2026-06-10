@@ -29,6 +29,8 @@ pub struct RespMinimalAuthorInfo<'a> {
     pub local: bool,
     pub host: Cow<'a, str>,
     pub remote_url: Option<Cow<'a, str>>,
+    #[serde(default)]
+    pub avatar: Option<JustURL<'a>>,
     pub is_bot: bool,
 }
 
@@ -38,6 +40,15 @@ pub struct RespMinimalPostInfo<'a> {
     pub title: Cow<'a, str>,
     pub remote_url: Option<Cow<'a, str>>,
     pub sensitive: bool,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RespFederationStatus {
+    Unsent,
+    Sent,
+    Received,
+    Posted,
 }
 
 #[derive(Deserialize, Debug)]
@@ -51,6 +62,7 @@ pub struct RespSomePostInfo<'a> {
     #[serde(borrow)]
     pub community: RespMinimalCommunityInfo<'a>,
     pub sticky: bool,
+    pub federation_status: Option<RespFederationStatus>,
 }
 
 impl<'a> AsRef<RespMinimalPostInfo<'a>> for RespSomePostInfo<'a> {
@@ -68,6 +80,19 @@ pub struct RespPostListPost<'a> {
 
 impl<'a> AsRef<RespSomePostInfo<'a>> for RespPostListPost<'a> {
     fn as_ref(&self) -> &RespSomePostInfo<'a> {
+        &self.base
+    }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespCommunityLastPostInfo<'a> {
+    #[serde(flatten)]
+    pub base: RespMinimalPostInfo<'a>,
+    pub created: Cow<'a, str>,
+}
+
+impl<'a> AsRef<RespMinimalPostInfo<'a>> for RespCommunityLastPostInfo<'a> {
+    fn as_ref(&self) -> &RespMinimalPostInfo<'a> {
         &self.base
     }
 }
@@ -99,6 +124,7 @@ pub struct RespThingComment<'a> {
     pub created: Cow<'a, str>,
     #[serde(borrow)]
     pub post: RespMinimalPostInfo<'a>,
+    pub federation_status: Option<RespFederationStatus>,
 }
 
 impl<'a> AsRef<RespMinimalCommentInfo<'a>> for RespThingComment<'a> {
@@ -122,7 +148,8 @@ pub struct RespPostCommentInfo<'a> {
     pub author: Option<RespMinimalAuthorInfo<'a>>,
     pub created: Cow<'a, str>,
     pub local: bool,
-    pub your_vote: Option<Empty>,
+    pub your_vote: Option<RespYourVote>,
+    pub federation_status: Option<RespFederationStatus>,
     pub replies: Option<RespList<'a, RespPostCommentInfo<'a>>>,
 }
 
@@ -159,7 +186,7 @@ pub struct RespPostInfo<'a> {
     pub rejected: bool,
     pub score: i64,
     pub local: bool,
-    pub your_vote: Option<Empty>,
+    pub your_vote: Option<RespYourVote>,
     pub poll: Option<RespPollInfo<'a>>,
 }
 
@@ -255,6 +282,12 @@ pub struct JustStringID<'a> {
 #[derive(Deserialize, Debug)]
 pub struct RespYourFollow {
     pub accepted: bool,
+    pub federation_status: Option<RespFederationStatus>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespYourVote {
+    pub federation_status: Option<RespFederationStatus>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -268,6 +301,12 @@ pub struct RespCommunityFeeds<'a> {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct RespCommunityVisibilitySuppression {
+    pub server: bool,
+    pub user: bool,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct RespCommunityInfoMaybeYour<'a> {
     #[serde(flatten)]
     pub base: RespMinimalCommunityInfo<'a>,
@@ -277,6 +316,10 @@ pub struct RespCommunityInfoMaybeYour<'a> {
 
     pub you_are_moderator: Option<bool>,
     pub your_follow: Option<RespYourFollow>,
+    pub last_post: Option<RespCommunityLastPostInfo<'a>>,
+    pub remote_post_count: Option<i64>,
+    pub latest_unfollow_status: Option<RespFederationStatus>,
+    pub visibility_suppression: Option<RespCommunityVisibilitySuppression>,
     pub pending_moderation_actions: Option<u32>,
 }
 
@@ -287,21 +330,263 @@ impl<'a> AsRef<RespMinimalCommunityInfo<'a>> for RespCommunityInfoMaybeYour<'a> 
 }
 
 #[derive(Deserialize, Debug)]
+pub struct RespCollectionTargetOwner<'a> {
+    pub id: Option<i64>,
+    pub remote_url: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespCollectionTargetPreviewItem<'a> {
+    pub id: i64,
+    pub ap_id: Cow<'a, str>,
+    #[serde(rename = "type")]
+    pub kind: Option<Cow<'a, str>>,
+    pub name: Cow<'a, str>,
+    pub url: Option<Cow<'a, str>>,
+    pub attributed_to: Option<Cow<'a, str>>,
+    pub content_html: Option<Cow<'a, str>>,
+    pub summary_html: Option<Cow<'a, str>>,
+    pub image_url: Option<Cow<'a, str>>,
+    pub published: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespCollectionTargetInfo<'a> {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub kind: Cow<'a, str>,
+    pub software: Option<Cow<'a, str>>,
+    pub name: Cow<'a, str>,
+    pub remote_url: Cow<'a, str>,
+    pub owner: RespCollectionTargetOwner<'a>,
+    pub followers: Option<Cow<'a, str>>,
+    pub first_page: Option<Cow<'a, str>>,
+    pub last_page: Option<Cow<'a, str>>,
+    pub summary_html: Option<Cow<'a, str>>,
+    pub total_items: Option<i64>,
+    pub your_follow: Option<RespYourFollow>,
+    pub latest_unfollow_status: Option<RespFederationStatus>,
+    #[serde(default)]
+    pub preview_items: Vec<RespCollectionTargetPreviewItem<'a>>,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct RespInstanceSoftwareInfo<'a> {
     pub name: Cow<'a, str>,
     pub version: Cow<'a, str>,
+}
+
+fn default_site_name<'a>() -> Cow<'a, str> {
+    Cow::Borrowed("lotide")
+}
+
+fn default_cleanup_remote_post_retention_days() -> i32 {
+    30
+}
+
+fn default_cleanup_preview_post_retention_hours() -> i32 {
+    24
+}
+
+fn default_cleanup_notification_retention_days() -> i32 {
+    90
+}
+
+fn default_cleanup_failed_inbox_task_payload_retention_days() -> i32 {
+    30
 }
 
 #[derive(Deserialize, Debug)]
 pub struct RespInstanceInfo<'a> {
     pub description: Content<'a>,
     pub software: RespInstanceSoftwareInfo<'a>,
+    #[serde(default = "default_site_name")]
+    pub site_name: Cow<'a, str>,
+    #[serde(default)]
+    pub site_logo: Option<JustURL<'a>>,
+    #[serde(default)]
+    pub site_css: Option<JustURL<'a>>,
     pub signup_allowed: bool,
     pub invitations_enabled: bool,
     pub community_creation_requirement: Option<Cow<'a, str>>,
     pub invitation_creation_requirement: Option<Cow<'a, str>>,
+    #[serde(default)]
+    pub cleanup_remote_posts_enabled: bool,
+    #[serde(default = "default_cleanup_remote_post_retention_days")]
+    pub cleanup_remote_post_retention_days: i32,
+    #[serde(default)]
+    pub cleanup_preview_posts_enabled: bool,
+    #[serde(default = "default_cleanup_preview_post_retention_hours")]
+    pub cleanup_preview_post_retention_hours: i32,
+    #[serde(default)]
+    pub cleanup_deleted_remote_communities_enabled: bool,
+    #[serde(default)]
+    pub cleanup_unfollowed_remote_communities_enabled: bool,
+    #[serde(default)]
+    pub cleanup_remote_interactions_enabled: bool,
+    #[serde(default)]
+    pub cleanup_notifications_enabled: bool,
+    #[serde(default = "default_cleanup_notification_retention_days")]
+    pub cleanup_notification_retention_days: i32,
+    #[serde(default)]
+    pub cleanup_failed_inbox_task_payloads_enabled: bool,
+    #[serde(default = "default_cleanup_failed_inbox_task_payload_retention_days")]
+    pub cleanup_failed_inbox_task_payload_retention_days: i32,
 
     pub web_push_vapid_key: Cow<'a, str>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminHostProfile {
+    pub host: String,
+    pub software: Option<String>,
+    pub active: bool,
+    pub last_checked: Option<String>,
+    pub last_success: Option<String>,
+    pub failed_checks: i32,
+    pub latest_error: Option<String>,
+    pub suppressed_reason: Option<String>,
+    pub suppressed_at: Option<String>,
+    pub interaction_probe_checked_at: Option<String>,
+    pub interaction_probe_success_at: Option<String>,
+    pub interaction_probe_latest_error: Option<String>,
+    pub discovered_communities_total: i64,
+    pub discovered_communities_active: i64,
+    pub discovered_communities_with_posts: i64,
+    pub communities_total: i64,
+    pub followed_communities_total: i64,
+    pub actor_profiles_total: i64,
+    pub high_confidence_actor_profiles_total: i64,
+    pub recent_events_total: i64,
+    pub recent_failures_total: i64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationSummary {
+    pub discovery_servers_total: i64,
+    pub discovery_servers_active: i64,
+    pub discovery_servers_inactive: i64,
+    pub discovery_servers_suppressed: i64,
+    pub discovery_servers_probe_success: i64,
+    pub discovered_communities_total: i64,
+    pub discovered_communities_active: i64,
+    pub discovered_communities_with_posts: i64,
+    pub actor_target_profiles_total: i64,
+    pub blocked_ap_ids_total: i64,
+    pub server_suppressed_communities_total: i64,
+    pub user_suppressed_communities_total: i64,
+    pub federation_events_total: i64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationServer {
+    pub host: String,
+    pub software: Option<String>,
+    pub active: bool,
+    pub last_checked: Option<String>,
+    pub last_success: Option<String>,
+    pub failed_checks: i32,
+    pub latest_error: Option<String>,
+    pub suppressed_reason: Option<String>,
+    pub suppressed_at: Option<String>,
+    pub interaction_probe_checked_at: Option<String>,
+    pub interaction_probe_success_at: Option<String>,
+    pub interaction_probe_latest_error: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationBlockedApId {
+    pub ap_id: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationServerSuppressedCommunity {
+    pub community_id: i64,
+    pub community_name: String,
+    pub community_ap_id: Option<String>,
+    pub reason: String,
+    pub updated_at: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationUserSuppressedCommunity {
+    pub community_id: i64,
+    pub community_name: String,
+    pub community_ap_id: Option<String>,
+    pub person_id: i64,
+    pub username: String,
+    pub person_ap_id: Option<String>,
+    pub reason: String,
+    pub updated_at: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationActorProfileFamily {
+    pub family: String,
+    pub target: String,
+    pub actor_kind: String,
+    pub count: i64,
+    pub high_confidence_count: i64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationActorProfile {
+    pub actor_ap_id: String,
+    pub target: String,
+    pub family: String,
+    pub actor_kind: String,
+    pub source: String,
+    pub confidence: i32,
+    pub has_inbox: bool,
+    pub has_outbox: bool,
+    pub has_followers: bool,
+    pub has_featured: bool,
+    pub observed_object_types: Vec<String>,
+    pub observed_activity_types: Vec<String>,
+    pub updated_at: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationEvent {
+    pub direction: String,
+    pub action: String,
+    pub status: String,
+    pub host: Option<String>,
+    pub actor_ap_id: Option<String>,
+    pub object_ap_id: Option<String>,
+    pub target_ap_id: Option<String>,
+    pub activity_type: Option<String>,
+    pub task_kind: Option<String>,
+    pub error_class: Option<String>,
+    pub error_text: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationReplayableTask {
+    pub id: i64,
+    pub kind: String,
+    pub state: String,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub latest_error: Option<String>,
+    pub created_at: String,
+    pub attempted_at: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespAdminFederationHealth {
+    pub summary: RespAdminFederationSummary,
+    pub suppressed_servers: Vec<RespAdminFederationServer>,
+    pub failing_servers: Vec<RespAdminFederationServer>,
+    pub host_profiles: Vec<RespAdminHostProfile>,
+    pub blocked_ap_ids: Vec<RespAdminFederationBlockedApId>,
+    pub server_suppressed_communities: Vec<RespAdminFederationServerSuppressedCommunity>,
+    pub user_suppressed_communities: Vec<RespAdminFederationUserSuppressedCommunity>,
+    pub actor_profile_families: Vec<RespAdminFederationActorProfileFamily>,
+    pub recent_actor_profiles: Vec<RespAdminFederationActorProfile>,
+    pub recent_events: Vec<RespAdminFederationEvent>,
+    pub replayable_failed_tasks: Vec<RespAdminFederationReplayableTask>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -385,6 +670,9 @@ pub enum RespNotificationInfo<'a> {
         #[serde(borrow)]
         post: RespPostListPost<'a>,
     },
+    UserFollow {
+        user: RespMinimalAuthorInfo<'a>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -411,6 +699,12 @@ pub struct JustUser<'a> {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct RespLikeInfo<'a> {
+    pub user: RespMinimalAuthorInfo<'a>,
+    pub federation_status: Option<RespFederationStatus>,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct JustContentText<'a> {
     pub content_text: Cow<'a, str>,
 }
@@ -424,4 +718,6 @@ pub struct JustContentHTML<'a> {
 pub struct RespList<'a, T: std::fmt::Debug + 'a> {
     pub items: Vec<T>,
     pub next_page: Option<Cow<'a, str>>,
+    #[serde(default)]
+    pub total_count: Option<i64>,
 }
