@@ -25,19 +25,15 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load() -> Result<Self, config::ConfigError> {
+    pub fn load(config_file_path: Option<&std::ffi::OsStr>) -> Result<Self, config::ConfigError> {
         let mut src = config::Config::builder()
             .add_source(config::Environment::default())
             .add_source(config::Environment::with_prefix("HITIDE"));
 
-        {
-            let mut args = std::env::args();
-            while let Some(arg) = args.next() {
-                if arg == "-c" {
-                    let path = args.next().expect("Missing parameter for config argument");
-                    src = src.add_source(SpecificFile { path: path.into() });
-                }
-            }
+        if let Some(config_file_path) = config_file_path {
+            src = src.add_source(SpecificFile {
+                path: config_file_path.into(),
+            });
         }
 
         src.build()?.try_deserialize()

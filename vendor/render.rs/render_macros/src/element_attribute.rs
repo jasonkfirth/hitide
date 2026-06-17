@@ -51,7 +51,7 @@ impl ElementAttribute {
             let alternative_name = self
                 .idents()
                 .iter()
-                .map(|x| x.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("_");
 
@@ -88,7 +88,7 @@ impl Eq for ElementAttribute {}
 impl Hash for ElementAttribute {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let ident = self.idents();
-        Hash::hash(&ident, state)
+        Hash::hash(&ident, state);
     }
 }
 

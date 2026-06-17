@@ -220,7 +220,7 @@ async fn handler_forgot_password_code_submit(
                         ctx.backend_host,
                         urlencoding::encode(&body.key),
                     ))
-                    .body(Default::default())?,
+                    .body(hyper::Body::default())?,
                     &req_parts.headers,
                     &cookies,
                 )?)

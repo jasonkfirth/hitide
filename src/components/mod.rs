@@ -20,8 +20,8 @@ fn federation_status_text(status: RespFederationStatus) -> &'static str {
     match status {
         RespFederationStatus::Unsent => "federation: unsent",
         RespFederationStatus::Sent => "federation: sent",
-        RespFederationStatus::Received => "federation: received",
-        RespFederationStatus::Posted => "federation: posted",
+        RespFederationStatus::Received => "federation: accepted",
+        RespFederationStatus::Posted => "federation: confirmed",
     }
 }
 
@@ -1394,7 +1394,7 @@ mod tests {
         );
     }
 
-    fn minimal_post_with_href<'a>(href: Option<&'a str>) -> RespPostListPost<'a> {
+    fn minimal_post_with_href(href: Option<&str>) -> RespPostListPost<'_> {
         RespPostListPost {
             base: crate::resp_types::RespSomePostInfo {
                 base: crate::resp_types::RespMinimalPostInfo {
@@ -1440,7 +1440,7 @@ mod tests {
         .unwrap();
 
         assert!(html.contains("federationStatusReceived"));
-        assert!(html.contains("federation: received"));
+        assert!(html.contains("federation: accepted"));
         assert_eq!(
             federation_status_line_class(Some(RespFederationStatus::Sent)),
             "federationStatusLine federationStatusLineSent"
@@ -1480,7 +1480,7 @@ mod tests {
 
     #[test]
     fn notification_item_renders_user_follow() {
-        let lang = crate::get_lang_for_headers(&Default::default());
+        let lang = crate::get_lang_for_headers(&crate::hyper::HeaderMap::default());
         let notification = RespNotification {
             info: RespNotificationInfo::UserFollow {
                 user: RespMinimalAuthorInfo {
@@ -1511,7 +1511,7 @@ mod tests {
 
     #[test]
     fn user_link_renders_avatar_when_available() {
-        let lang = crate::get_lang_for_headers(&Default::default());
+        let lang = crate::get_lang_for_headers(&crate::hyper::HeaderMap::default());
         let user = RespMinimalAuthorInfo {
             id: 7,
             username: "alice".into(),
@@ -1572,7 +1572,7 @@ mod tests {
 
     #[test]
     fn post_item_content_neutralizes_unsafe_remote_href() {
-        let lang = crate::get_lang_for_headers(&Default::default());
+        let lang = crate::get_lang_for_headers(&crate::hyper::HeaderMap::default());
         let post = minimal_post_with_href(Some("javascript:alert(1)"));
         let mut html = String::new();
 
@@ -1591,7 +1591,7 @@ mod tests {
 
     #[test]
     fn post_item_content_keeps_safe_remote_href() {
-        let lang = crate::get_lang_for_headers(&Default::default());
+        let lang = crate::get_lang_for_headers(&crate::hyper::HeaderMap::default());
         let post = minimal_post_with_href(Some("https://example.com/article"));
         let mut html = String::new();
 

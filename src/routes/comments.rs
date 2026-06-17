@@ -60,7 +60,7 @@ async fn page_comment_inner(
         page: Option<Cow<'a, str>>,
     }
 
-    let query: Query = serde_urlencoded::from_str(query.unwrap_or(""))?;
+    let query: Query = crate::parse_query_string(query)?;
 
     let base_data = fetch_base_data(&ctx.backend_host, &ctx.http_client, headers, cookies).await?;
 
@@ -77,7 +77,7 @@ async fn page_comment_inner(
                         ""
                     },
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 headers,
                 cookies,
             )?)
@@ -96,7 +96,7 @@ async fn page_comment_inner(
                             "{}/api/unstable/posts/{}?include_your=true",
                             ctx.backend_host, post_ref.id,
                         ))
-                        .body(Default::default())?,
+                        .body(hyper::Body::default())?,
                         headers,
                         cookies,
                     )?)
@@ -114,7 +114,7 @@ async fn page_comment_inner(
                             ctx.backend_host,
                             post_info.as_ref().community.id,
                         ))
-                        .body(Default::default())?,
+                        .body(hyper::Body::default())?,
                         headers,
                         cookies,
                     )?)
@@ -168,7 +168,7 @@ async fn page_comment_inner(
                     "{}/api/unstable/comments/{}/replies?{}",
                     ctx.backend_host, comment_id, replies_req_query,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 headers,
                 cookies,
             )?)
@@ -399,7 +399,7 @@ async fn page_comment_delete_inner(
                     "{}/api/unstable/comments/{}",
                     ctx.backend_host, comment_id
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 headers,
                 cookies,
             )?)
@@ -514,7 +514,7 @@ async fn handler_comment_like(
                     "{}/api/unstable/comments/{}/your_vote",
                     ctx.backend_host, comment_id
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -557,7 +557,7 @@ async fn handler_comment_unlike(
                     "{}/api/unstable/comments/{}/your_vote",
                     ctx.backend_host, comment_id
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -646,7 +646,7 @@ async fn handler_comment_submit_reply(
                     Some(mime) => {
                         let res = res_to_error(
                             ctx.http_client
-                                .request(for_client(
+                                .request_upload(for_client(
                                     hyper::Request::post(format!(
                                         "{}/api/unstable/media",
                                         ctx.backend_host,

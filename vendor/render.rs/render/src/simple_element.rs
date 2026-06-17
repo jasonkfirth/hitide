@@ -15,10 +15,7 @@ pub struct SimpleElement<'a, T: Render> {
     pub contents: Option<T>,
 }
 
-fn write_attributes<'a, W: Write + ?Sized>(
-    maybe_attributes: Attributes<'a>,
-    writer: &mut W,
-) -> Result {
+fn write_attributes<W: Write + ?Sized>(maybe_attributes: Attributes<'_>, writer: &mut W) -> Result {
     match maybe_attributes {
         None => Ok(()),
         Some(mut attributes) => {

@@ -3,7 +3,7 @@ about_title = A propos de cette instance
 about_what_is = QU'est ce que lotide ?
 about_text1 = lotide est un essai de création de forum fédéré. Les utilisateurs peuvent créer des communautés et partager des liens ou du texte et en discuter avec d'autres utilisateurs, y compris ceux inscrits sur d'autres instances.
 about_text2 = Pour plus d'information ou pour consulter le code source, rendez-vous sur la { $part_sourcehut }
-about_text2_part_sourcehut = page SourceHut 
+about_text2_part_sourcehut = page SourceHut
 about_versions = Cette instance fonctionne avec hitide { $hitide_version } sur { $backend_name } { $backend_version }.
 add = Ajouter
 add_by_remote_id = Ajouter par ID:
@@ -102,7 +102,7 @@ timeago_months =
     il y a { $months } { $months ->
         [one] mois
         *[other] mois
-    } 
+    }
 timeago_weeks =
     il y a { $weeks } { $weeks ->
         [one] semaine
@@ -127,7 +127,7 @@ timeago_seconds =
     il y a { $seconds } { $seconds ->
         [one] seconde
         *[other] secondes
-    } 
+    }
 timeago_now = maintenant
 timeago_future = dans le futur
 title = Titre

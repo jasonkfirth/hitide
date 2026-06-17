@@ -26,12 +26,11 @@ impl ToTokens for Child {
 
 impl Parse for Child {
     fn parse(input: ParseStream) -> Result<Self> {
-        match input.parse::<Element>() {
-            Ok(element) => Ok(Self::Element(element)),
-            Err(_) => {
-                let block = input.parse::<syn::Block>()?;
-                Ok(Self::RawBlock(block))
-            }
+        if let Ok(element) = input.parse::<Element>() {
+            Ok(Self::Element(element))
+        } else {
+            let block = input.parse::<syn::Block>()?;
+            Ok(Self::RawBlock(block))
         }
     }
 }

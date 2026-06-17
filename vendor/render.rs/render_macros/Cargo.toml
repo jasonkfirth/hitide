@@ -7,7 +7,7 @@ description = "The macros needed for `render`"
 readme = "../README.md"
 repository = "https://github.com/Schniz/render.rs"
 keywords = ["macro"]
-categories = []
+categories = ["template-engine"]
 license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -20,3 +20,7 @@ syn = { version = "1.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
 proc-macro-error3 = "3.0.1"
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+render = { path = "../render", version = "0.3.1" }

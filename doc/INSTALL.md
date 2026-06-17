@@ -4,10 +4,11 @@ Hitide is the browser frontend for Lotide. It renders HTML and CSS and talks to
 the Lotide backend through `BACKEND_HOST`. It does not own the database,
 ActivityPub inboxes, migrations, media storage, or background tasks.
 
-This guide documents a Debian source-tree install that runs from `/var/hitide`.
-Helper scripts under `build_scripts/` install a conventional `/usr/local/bin`
-layout, but the steps below match the wrapper script and systemd unit used by
-the current deployment.
+This guide documents the direct Debian source-tree install used by the live
+production instance. There are also helper scripts under `build_scripts/` that install
+a conventional `/usr/local/bin` layout, but the direct `/var/hitide` layout is
+the one described here because it matches the wrapper script and systemd unit
+that are known to start the current service successfully.
 
 Do not copy live passwords from another instance. The examples below use
 placeholders.
@@ -71,8 +72,8 @@ sudo git clone https://git.sr.ht/~vpzom/hitide/ hitide
 sudo chown -R lotide:lotide /var/hitide
 ```
 
-If you are deploying this tree instead of the public upstream, copy or clone it
-into `/var/hitide` and keep the same ownership.
+If you are deploying this locally maintained tree instead of the public upstream,
+copy or clone that tree into `/var/hitide` and keep the same ownership.
 
 ## Build
 
@@ -123,12 +124,12 @@ sudo chown lotide:lotide /var/hitide/target/release/hitide.sh
 sudo chmod 0750 /var/hitide/target/release/hitide.sh
 ```
 
-The longer wrapper keeps the same environment block as Lotide so one deployment
-can share settings between services. Hitide only reads `BACKEND_HOST`,
-`FRONTEND_URL`, `BIND_ADDRESS`, and optional `PORT`, so the database,
-ActivityPub, media, and SMTP values are harmless but not required.
+The working live wrapper keeps a shared Lotide environment block for operational
+symmetry. Hitide's current configuration reads `BACKEND_HOST`, `FRONTEND_URL`,
+`BIND_ADDRESS`, and optional `PORT`, so the database, ActivityPub, media, and
+SMTP values are harmless but not required by Hitide.
 
-A minimal wrapper is:
+The minimal equivalent is:
 
 ```sh
 #!/bin/bash

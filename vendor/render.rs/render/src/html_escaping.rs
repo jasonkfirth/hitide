@@ -19,7 +19,7 @@ pub fn escape_html<W: Write + ?Sized>(html: &str, writer: &mut W) -> Result {
             '&' => write!(writer, "&amp;")?,
             '\'' => write!(writer, "&apos;")?,
             c => writer.write_char(c)?,
-        };
+        }
     }
 
     Ok(())

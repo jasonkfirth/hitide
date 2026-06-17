@@ -22,7 +22,7 @@ async fn page_moderation(
         community: Option<i64>,
     }
 
-    let query: Query = serde_urlencoded::from_str(req.uri().query().unwrap_or(""))?;
+    let query: Query = crate::parse_query_string(req.uri().query())?;
 
     let base_data =
         fetch_base_data(&ctx.backend_host, &ctx.http_client, req.headers(), &cookies).await?;
@@ -34,7 +34,7 @@ async fn page_moderation(
                     "{}/api/unstable/communities?you_are_moderator=true&include_your=true",
                     ctx.backend_host,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -55,7 +55,7 @@ async fn page_moderation(
                         "{}/api/unstable/flags?to_community={}&dismissed=false",
                         ctx.backend_host, community,
                     ))
-                    .body(Default::default())?,
+                    .body(hyper::Body::default())?,
                     req.headers(),
                     &cookies,
                 )?)

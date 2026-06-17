@@ -136,7 +136,7 @@ async fn fetch_base_data(
         let api_res = http_client
             .request(for_client(
                 hyper::Request::get(format!("{backend_host}/api/unstable/logins/~current"))
-                    .body(Default::default())?,
+                    .body(hyper::Body::default())?,
                 headers,
                 cookies,
             )?)
@@ -151,26 +151,41 @@ async fn fetch_base_data(
         }
     }?;
 
-    let instance_info = res_to_error(
-        http_client
+    let mut base_data = PageBaseData::fallback(login);
+
+    let instance_info = async {
+        let res = http_client
             .request(for_client(
                 hyper::Request::get(format!("{backend_host}/api/unstable/instance"))
-                    .body(Default::default())?,
+                    .body(hyper::Body::default())?,
                 headers,
                 cookies,
             )?)
-            .await?,
-    )
-    .await?;
-    let instance_info = crate::read_body_with_timeout(instance_info.into_body()).await?;
-    let instance_info: RespInstanceInfo = serde_json::from_slice(&instance_info)?;
+            .await?;
+        let res = res_to_error(res).await?;
+        let res = crate::read_body_with_timeout(res.into_body()).await?;
+        let instance_info: RespInstanceInfo<'_> = serde_json::from_slice(&res)?;
 
-    Ok(PageBaseData {
-        login,
-        site_name: instance_info.site_name.into_owned(),
-        site_logo_url: instance_info.site_logo.map(|logo| logo.url.into_owned()),
-        site_css_url: instance_info.site_css.map(|css| css.url.into_owned()),
-    })
+        Ok::<_, crate::Error>((
+            instance_info.site_name.into_owned(),
+            instance_info.site_logo.map(|logo| logo.url.into_owned()),
+            instance_info.site_css.map(|css| css.url.into_owned()),
+        ))
+    }
+    .await;
+
+    match instance_info {
+        Ok((site_name, site_logo_url, site_css_url)) => {
+            base_data.site_name = site_name;
+            base_data.site_logo_url = site_logo_url;
+            base_data.site_css_url = site_css_url;
+        }
+        Err(err) => {
+            log::warn!("Unable to load backend instance metadata for page chrome: {err:?}");
+        }
+    }
+
+    Ok(base_data)
 }
 
 fn html_response(html: String) -> hyper::Response<hyper::Body> {
@@ -477,7 +492,7 @@ async fn handler_logout(
                     "{}/api/unstable/logins/~current",
                     ctx.backend_host,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -510,7 +525,7 @@ async fn page_lookup(
         query: Option<Cow<'a, str>>,
     }
 
-    let query: LookupQuery<'_> = serde_urlencoded::from_str(req.uri().query().unwrap_or(""))?;
+    let query: LookupQuery<'_> = crate::parse_query_string(req.uri().query())?;
     let query = query.query;
 
     #[derive(Deserialize)]
@@ -539,7 +554,7 @@ async fn page_lookup(
                         ctx.backend_host,
                         urlencoding::encode(query)
                     ))
-                    .body(Default::default())?,
+                    .body(hyper::Body::default())?,
                 )
                 .await?,
         )
@@ -567,7 +582,7 @@ async fn page_lookup(
                                 ctx.backend_host,
                                 urlencoding::encode(query)
                             ))
-                            .body(Default::default())?,
+                            .body(hyper::Body::default())?,
                         )
                         .await?,
                 )
@@ -655,7 +670,7 @@ async fn page_collection_target(
                     "{}/api/unstable/collection_targets/{}",
                     ctx.backend_host, collection_target_id,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -728,7 +743,7 @@ async fn page_collection_target(
             <p>
                 <em>{collection.software.as_deref().unwrap_or_else(|| collection.kind.as_ref())}</em>
                 {" "}
-                <a href={safe_href(collection.remote_url.as_ref()).unwrap_or("#")}>{lang.tr(&lang::VIEW_AT_SOURCE)}{" ↗"}</a>
+                <a href={safe_href(collection.remote_url.as_ref()).unwrap_or("#")}>{lang.tr(&lang::VIEW_AT_SOURCE)}{" â†—"}</a>
             </p>
             {
                 collection.total_items.map(|total_items| {
@@ -838,7 +853,7 @@ async fn handler_collection_target_unfollow(
                     "{}/api/unstable/collection_targets/{}/unfollow",
                     ctx.backend_host, collection_target_id
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -875,7 +890,7 @@ async fn page_modlog(
                     "{}/api/unstable/instance/modlog/events",
                     ctx.backend_host,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -997,7 +1012,7 @@ async fn handler_my_invitations_create(
         ctx.http_client
             .request(for_client(
                 hyper::Request::post(format!("{}/api/unstable/invitations", ctx.backend_host))
-                    .body(Default::default())?,
+                    .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -1167,7 +1182,7 @@ async fn page_notifications(
                     "{}/api/unstable/users/~me/notifications",
                     ctx.backend_host
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -1227,7 +1242,7 @@ async fn page_signup(
     ctx: Arc<crate::RouteContext>,
     req: hyper::Request<hyper::Body>,
 ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
-    let query: SignupQuery = serde_urlencoded::from_str(req.uri().query().unwrap_or(""))?;
+    let query: SignupQuery = crate::parse_query_string(req.uri().query())?;
 
     page_signup_inner(ctx, req.headers(), query, None, None).await
 }
@@ -1456,7 +1471,7 @@ async fn page_user(
                         ""
                     },
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -1473,7 +1488,7 @@ async fn page_user(
                     "{}/api/unstable/users/{}/things",
                     ctx.backend_host, user_id,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
             )
             .await?,
     )
@@ -1669,7 +1684,7 @@ async fn page_user_edit(
                     "{}/api/unstable/users/{}",
                     ctx.backend_host, user_id
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
             )
             .await?,
     )
@@ -1825,7 +1840,7 @@ async fn handler_user_avatar_submit(
 
             let res = res_to_error(
                 ctx.http_client
-                    .request(for_client(
+                    .request_upload(for_client(
                         hyper::Request::post(format!("{}/api/unstable/media", ctx.backend_host))
                             .header(hyper::header::CONTENT_TYPE, mime.as_ref())
                             .body(hyper::Body::wrap_stream(stream))?,
@@ -2024,7 +2039,7 @@ async fn page_user_your_note_edit(
                     "{}/api/unstable/users/{}?include_your=true",
                     ctx.backend_host, user_id,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -2106,7 +2121,7 @@ async fn page_home(
         page: Option<Cow<'a, str>>,
     }
 
-    let query: Query = serde_urlencoded::from_str(req.uri().query().unwrap_or(""))?;
+    let query: Query = crate::parse_query_string(req.uri().query())?;
 
     let api_res = res_to_error(
         ctx.http_client
@@ -2116,7 +2131,7 @@ async fn page_home(
                     ctx.backend_host,
                     serde_urlencoded::to_string(home_posts_query(query.page.as_deref()))?,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -2202,7 +2217,7 @@ async fn page_all_inner(
         page: Option<Cow<'a, str>>,
     }
 
-    let query: Query = serde_urlencoded::from_str(query.unwrap_or(""))?;
+    let query: Query = crate::parse_query_string(query)?;
 
     let api_res = res_to_error(
         ctx.http_client
@@ -2215,7 +2230,7 @@ async fn page_all_inner(
                         None,
                     ))?,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 headers,
                 cookies,
             )?)
@@ -2278,7 +2293,7 @@ async fn page_flags(
         to_community: Option<i64>,
     }
 
-    let query: Query = serde_urlencoded::from_str(req.uri().query().unwrap_or(""))?;
+    let query: Query = crate::parse_query_string(req.uri().query())?;
 
     let api_res = res_to_error(
         ctx.http_client
@@ -2291,7 +2306,7 @@ async fn page_flags(
                         to_community: query.to_community,
                     })?,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -2371,7 +2386,7 @@ async fn page_local(
         page: Option<Cow<'a, str>>,
     }
 
-    let query: Query = serde_urlencoded::from_str(req.uri().query().unwrap_or(""))?;
+    let query: Query = crate::parse_query_string(req.uri().query())?;
 
     let api_res = res_to_error(
         ctx.http_client
@@ -2384,7 +2399,7 @@ async fn page_local(
                         Some(true),
                     ))?,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)

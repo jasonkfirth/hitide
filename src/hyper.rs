@@ -29,7 +29,7 @@ pub use ::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 
 use bytes::Bytes;
 use futures_util::TryStreamExt as _;
-use http_body_util::{BodyExt as _, Empty, Full, StreamBody, combinators::UnsyncBoxBody};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt as _, Empty, Full, StreamBody};
 use hyper1::body::Body as HyperBody;
 use std::fmt;
 use std::pin::Pin;
@@ -248,10 +248,20 @@ impl ClientBuilder {
     where
         C: hyper_util::client::legacy::connect::Connect + Clone,
     {
+        /*
+            Hitide talks to Lotide through a local backend URL. Keeping pooled
+            sockets around for too long makes the first page after a backend
+            restart wait for the full request timeout before reconnecting.
+            A short idle window keeps normal keep-alive behavior without
+            letting dead local sockets linger.
+        */
+        let mut builder =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new());
+        builder.pool_idle_timeout(std::time::Duration::from_secs(5));
+        builder.pool_timer(hyper_util::rt::TokioTimer::new());
+
         Client {
-            inner:
-                hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                    .build(connector),
+            inner: builder.build(connector),
         }
     }
 }

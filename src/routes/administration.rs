@@ -16,6 +16,26 @@ use std::convert::TryInto;
 use std::sync::Arc;
 
 const ADMIN_DIAGNOSTIC_SUMMARY_CHARS: usize = 180;
+const ADMIN_BOOLEAN_SITE_SETTINGS: &[&str] = &[
+    "cleanup_remote_posts_enabled",
+    "cleanup_preview_posts_enabled",
+    "cleanup_deleted_remote_communities_enabled",
+    "cleanup_unfollowed_remote_communities_enabled",
+    "cleanup_remote_interactions_enabled",
+    "cleanup_notifications_enabled",
+    "cleanup_failed_inbox_task_payloads_enabled",
+];
+const ADMIN_NUMERIC_SITE_SETTINGS: &[&str] = &[
+    "cleanup_remote_post_retention_days",
+    "cleanup_preview_post_retention_hours",
+    "cleanup_notification_retention_days",
+    "cleanup_failed_inbox_task_payload_retention_days",
+    "cleanup_completed_task_retention_days",
+    "cleanup_failed_task_retention_days",
+    "cleanup_failed_inbox_task_payload_compaction_hours",
+    "discovery_enqueue_limit",
+    "discovery_refresh_interval_hours",
+];
 
 fn truncate_admin_diagnostic_summary(value: &str) -> String {
     let mut output = String::new();
@@ -142,6 +162,76 @@ fn admin_diagnostic_summary(value: &str) -> String {
     summary.to_owned()
 }
 
+fn admin_failure_category_label(value: Option<&str>) -> &'static str {
+    match value {
+        Some("domain_block") => "domain block",
+        Some("user_or_community_ban") => "user/community ban",
+        Some("timeout") => "timeout",
+        Some("dns") => "DNS",
+        Some("tls") => "TLS",
+        Some("bot_challenge") => "bot challenge",
+        Some("private") => "private",
+        Some("no_probe_target") => "no probe target",
+        Some("unsupported_activitypub") => "unsupported ActivityPub",
+        Some("not_found") => "not found",
+        Some("remote_5xx") => "remote 5xx",
+        Some("connection") => "connection",
+        Some("bad_remote_response") => "bad remote response",
+        Some("suppressed") => "suppressed",
+        Some("other") => "other",
+        Some(_) => "uncategorized",
+        None => "none",
+    }
+}
+
+fn admin_catalog_status_label(value: Option<&str>) -> &'static str {
+    match value {
+        Some("useful_recent") => "useful, recent catalog",
+        Some("useful_stale") => "useful, stale catalog",
+        Some("verified_no_useful_catalog") => "verified, no useful catalog",
+        Some("known_only") => "known only",
+        Some("inactive") => "inactive",
+        Some("suppressed") => "suppressed",
+        Some(_) => "uncategorized",
+        None => "unknown",
+    }
+}
+
+fn admin_followed_community_health_label(value: &str) -> &'static str {
+    match value {
+        "missing_host_profile" => "missing host profile",
+        "suppressed_host" => "host suppressed",
+        "inactive_host" => "host inactive",
+        "no_visible_posts" => "no visible posts",
+        "stale_90d" => "no posts in 90 days",
+        "stale_30d" => "no posts in 30 days",
+        "catalog_stale" => "catalog stale",
+        "ok" => "ok",
+        _ => "unknown",
+    }
+}
+
+fn admin_bytes_label(bytes: i64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes.max(0) as f64;
+    let mut unit = units[0];
+
+    for next_unit in units.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+
+        value /= 1024.0;
+        unit = next_unit;
+    }
+
+    if unit == "B" {
+        format!("{} {}", bytes.max(0), unit)
+    } else {
+        format!("{value:.1} {unit}")
+    }
+}
+
 struct AdminDiagnostic<'a> {
     value: Option<&'a str>,
 }
@@ -172,6 +262,13 @@ impl render::Render for AdminDiagnostic<'_> {
     }
 }
 
+/*
+    The administration dashboard is deliberately kept as one server-rendered
+    page so related operator controls stay together. The render macro expands
+    that page into a large typed tree, and the stricter stack-frame lint counts
+    the generated template state even though the route renders it immediately.
+*/
+#[allow(clippy::large_stack_frames)]
 async fn page_administration(
     _params: (),
     ctx: Arc<crate::RouteContext>,
@@ -216,7 +313,7 @@ async fn page_administration(
                     "{}/api/unstable/instance/federation",
                     ctx.backend_host,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -374,15 +471,31 @@ async fn page_administration(
                     {" days"}
                 </li>
                 <li>
-                    {"Failed inbox payload cleanup: "}
+                    {"Task cleanup: completed rows kept "}
+                    <strong>{api_res.cleanup_completed_task_retention_days.to_string()}</strong>
+                    {" days, failed rows kept "}
+                    <strong>{api_res.cleanup_failed_task_retention_days.to_string()}</strong>
+                    {" days"}
+                </li>
+                <li>
+                    {"Failed inbox payload compaction: "}
                     <strong>{lang.tr(if api_res.cleanup_failed_inbox_task_payloads_enabled {
                         &lang::ENABLED_TRUE
                     } else {
                         &lang::ENABLED_FALSE
                     })}</strong>
                     {" after "}
+                    <strong>{api_res.cleanup_failed_inbox_task_payload_compaction_hours.to_string()}</strong>
+                    {" hours; failed inbox rows kept "}
                     <strong>{api_res.cleanup_failed_inbox_task_payload_retention_days.to_string()}</strong>
                     {" days"}
+                </li>
+                <li>
+                    {"Community discovery: "}
+                    <strong>{api_res.discovery_enqueue_limit.to_string()}</strong>
+                    {" hosts per scheduler pass, healthy hosts refresh every "}
+                    <strong>{api_res.discovery_refresh_interval_hours.to_string()}</strong>
+                    {" hours"}
                 </li>
             </ul>
             <h2>{"Federation health"}</h2>
@@ -399,9 +512,53 @@ async fn page_administration(
                     {" suppressed"}
                 </li>
                 <li>
+                    {"Community sources: "}
+                    <strong>{federation_res.summary.discovery_servers_useful_sources.to_string()}</strong>
+                    {" useful, "}
+                    <strong>{federation_res.summary.discovery_servers_known_only.to_string()}</strong>
+                    {" known only, "}
+                    <strong>{federation_res.summary.discovery_servers_due.to_string()}</strong>
+                    {" due for refresh"}
+                </li>
+                <li>
                     {"Interaction probes: "}
                     <strong>{federation_res.summary.discovery_servers_probe_success.to_string()}</strong>
                     {" hosts have passed at least one empirical probe"}
+                </li>
+                <li>
+                    {"Task queue: "}
+                    <strong>{federation_res.summary.task_pending_total.to_string()}</strong>
+                    {" pending, "}
+                    <strong>{federation_res.summary.task_running_total.to_string()}</strong>
+                    {" running, "}
+                    <strong>{federation_res.summary.task_failed_total.to_string()}</strong>
+                    {" failed, "}
+                    <strong>{federation_res.summary.task_completed_total.to_string()}</strong>
+                    {" completed; table "}
+                    <strong>{admin_bytes_label(federation_res.summary.task_table_bytes)}</strong>
+                    {
+                        federation_res.summary.task_oldest_pending.as_deref().map(|oldest| {
+                            render::rsx! {
+                                <>
+                                    {"; oldest pending "}
+                                    <strong>{oldest}</strong>
+                                </>
+                            }
+                        })
+                    }
+                    <br />
+                    <small>
+                        {"pending lanes: outbound "}
+                        {federation_res.summary.task_pending_outbound.to_string()}
+                        {", inbox "}
+                        {federation_res.summary.task_pending_inbox.to_string()}
+                        {", discovery "}
+                        {federation_res.summary.task_pending_discovery.to_string()}
+                        {", preview "}
+                        {federation_res.summary.task_pending_preview.to_string()}
+                        {", readback "}
+                        {federation_res.summary.task_pending_readback.to_string()}
+                    </small>
                 </li>
                 <li>
                     {"Discovered communities: "}
@@ -410,7 +567,9 @@ async fn page_administration(
                     <strong>{federation_res.summary.discovered_communities_active.to_string()}</strong>
                     {" active, "}
                     <strong>{federation_res.summary.discovered_communities_with_posts.to_string()}</strong>
-                    {" active with posts"}
+                    {" active with posts, "}
+                    <strong>{federation_res.summary.discovered_communities_visible.to_string()}</strong>
+                    {" visible useful rows"}
                 </li>
                 <li>
                     {"Actor platform profiles: "}
@@ -432,6 +591,106 @@ async fn page_administration(
                     <strong>{federation_res.summary.federation_events_total.to_string()}</strong>
                 </li>
             </ul>
+            <h3>{"Followed community health"}</h3>
+            <table class={"adminFederationTable"}>
+                <thead>
+                    <tr>
+                        <th>{"Community"}</th>
+                        <th>{"Host"}</th>
+                        <th>{"Health"}</th>
+                        <th>{"Posts"}</th>
+                        <th>{"Catalog"}</th>
+                        <th>{"Latest issue"}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {
+                        if federation_res.followed_community_health.is_empty() {
+                            vec![render::rsx! {
+                                <tr>
+                                    <td>
+                                        <a href={String::new()}>{"None"}</a>
+                                        <br />
+                                        <small>{""}</small>
+                                    </td>
+                                    <td>
+                                        {""}
+                                        <br />
+                                        <small>{""}</small>
+                                    </td>
+                                    <td>
+                                        {""}
+                                        <br />
+                                        <small>{String::new()}</small>
+                                    </td>
+                                    <td>
+                                        {String::new()}
+                                        <br />
+                                        <small>{String::new()}</small>
+                                    </td>
+                                    <td>
+                                        <small>{String::new()}</small>
+                                        <br />
+                                        <small>{String::new()}</small>
+                                    </td>
+                                    <td><AdminDiagnostic value={None} /></td>
+                                </tr>
+                            }]
+                        } else {
+                            federation_res.followed_community_health.iter().map(|community| {
+                                let href = format!("/communities/{}", community.community_id);
+                                let host_status = match community.host_active {
+                                    Some(true) => "active",
+                                    Some(false) => "inactive",
+                                    None => "unknown",
+                                };
+                                let host_failures = community.host_failed_checks.unwrap_or(0);
+                                let health_detail = community.suppressed_reason.as_deref()
+                                    .or(community.latest_error.as_deref());
+                                let post_counts = format!(
+                                    "{} visible, {} remote",
+                                    community.visible_posts,
+                                    community.remote_post_count,
+                                );
+                                let last_post = community.last_post.as_deref().unwrap_or("never");
+                                let catalog_seen = community.catalog_last_seen.as_deref()
+                                    .unwrap_or("never");
+
+                                render::rsx! {
+                                    <tr>
+                                        <td>
+                                            <a href={href}>{community.community_name.as_str()}</a>
+                                            <br />
+                                            <small>{community.community_ap_id.as_deref().unwrap_or("")}</small>
+                                        </td>
+                                        <td>
+                                            {community.host.as_str()}
+                                            <br />
+                                            <small>{community.software.as_deref().unwrap_or("")}</small>
+                                        </td>
+                                        <td>
+                                            {admin_followed_community_health_label(community.health_status.as_str())}
+                                            <br />
+                                            <small>{format!("{host_status}; {host_failures} host failures")}</small>
+                                        </td>
+                                        <td>
+                                            {post_counts}
+                                            <br />
+                                            <small>{format!("last post {last_post}; {} local followers", community.local_followers)}</small>
+                                        </td>
+                                        <td>
+                                            <small>{format!("last seen {catalog_seen}")}</small>
+                                            <br />
+                                            <small>{format!("last success {}", community.last_success.as_deref().unwrap_or("never"))}</small>
+                                        </td>
+                                        <td><AdminDiagnostic value={health_detail} /></td>
+                                    </tr>
+                                }
+                            }).collect::<Vec<_>>()
+                        }
+                    }
+                </tbody>
+            </table>
             <h3>{"Recent federation events"}</h3>
             <table class={"adminFederationTable"}>
                 <thead>
@@ -543,6 +802,7 @@ async fn page_administration(
                         <th>{"Host"}</th>
                         <th>{"Software"}</th>
                         <th>{"Health"}</th>
+                        <th>{"Source"}</th>
                         <th>{"Communities"}</th>
                         <th>{"Actor profiles"}</th>
                         <th>{"Recent events"}</th>
@@ -562,6 +822,11 @@ async fn page_administration(
                                         {" failures"}
                                         <br />
                                         <AdminDiagnostic value={None} />
+                                    </td>
+                                    <td>
+                                        {""}
+                                        <br />
+                                        <small>{String::new()}</small>
                                     </td>
                                     <td>{String::new()}</td>
                                     <td>{String::new()}</td>
@@ -602,6 +867,16 @@ async fn page_administration(
                                             <br />
                                             <AdminDiagnostic value={health} />
                                         </td>
+                                        <td>
+                                            {admin_catalog_status_label(profile.catalog_status.as_deref())}
+                                            <br />
+                                            <small>{
+                                                match profile.newest_community_seen.as_deref() {
+                                                    Some(newest) => format!("last catalog row {newest}; {}", admin_failure_category_label(profile.failure_category.as_deref())),
+                                                    None => admin_failure_category_label(profile.failure_category.as_deref()).to_owned(),
+                                                }
+                                            }</small>
+                                        </td>
                                         <td>{communities}</td>
                                         <td>{actors}</td>
                                         <td>{events}</td>
@@ -618,6 +893,7 @@ async fn page_administration(
                     <tr>
                         <th>{"Host"}</th>
                         <th>{"Software"}</th>
+                        <th>{"Category"}</th>
                         <th>{"Reason"}</th>
                         <th>{"Probe error"}</th>
                     </tr>
@@ -629,6 +905,7 @@ async fn page_administration(
                                 <tr>
                                     <td>{"None"}</td>
                                     <td>{""}</td>
+                                    <td>{""}</td>
                                     <td><AdminDiagnostic value={None} /></td>
                                     <td><AdminDiagnostic value={None} /></td>
                                 </tr>
@@ -639,6 +916,7 @@ async fn page_administration(
                                     <tr>
                                         <td>{server.host.as_str()}</td>
                                         <td>{server.software.as_deref().unwrap_or("")}</td>
+                                        <td>{admin_failure_category_label(server.failure_category.as_deref())}</td>
                                         <td>
                                             <AdminDiagnostic value={server.suppressed_reason.as_deref()} />
                                         </td>
@@ -660,6 +938,7 @@ async fn page_administration(
                         <th>{"Software"}</th>
                         <th>{"Active"}</th>
                         <th>{"Failures"}</th>
+                        <th>{"Category"}</th>
                         <th>{"Latest error"}</th>
                     </tr>
                 </thead>
@@ -672,6 +951,7 @@ async fn page_administration(
                                     <td>{""}</td>
                                     <td>{""}</td>
                                     <td>{String::new()}</td>
+                                    <td>{""}</td>
                                     <td><AdminDiagnostic value={None} /></td>
                                 </tr>
                             }]
@@ -683,6 +963,7 @@ async fn page_administration(
                                         <td>{server.software.as_deref().unwrap_or("")}</td>
                                         <td>{if server.active { "yes" } else { "no" }}</td>
                                         <td>{server.failed_checks.to_string()}</td>
+                                        <td>{admin_failure_category_label(server.failure_category.as_deref())}</td>
                                         <td>
                                             <AdminDiagnostic value={server.latest_error.as_deref()
                                                 .or(server.interaction_probe_latest_error.as_deref())} />
@@ -956,6 +1237,13 @@ async fn page_administration_edit_inner(
     let failed_inbox_payload_retention_days = api_res
         .cleanup_failed_inbox_task_payload_retention_days
         .to_string();
+    let completed_task_retention_days = api_res.cleanup_completed_task_retention_days.to_string();
+    let failed_task_retention_days = api_res.cleanup_failed_task_retention_days.to_string();
+    let failed_inbox_payload_compaction_hours = api_res
+        .cleanup_failed_inbox_task_payload_compaction_hours
+        .to_string();
+    let discovery_enqueue_limit = api_res.discovery_enqueue_limit.to_string();
+    let discovery_refresh_interval_hours = api_res.discovery_refresh_interval_hours.to_string();
 
     let (description_content, description_format) = match api_res.description.content_markdown {
         Some(content) => (content, "markdown"),
@@ -1222,13 +1510,81 @@ async fn page_administration_edit_inner(
                     </div>
                     <div>
                         <label>
-                            {"Failed inbox task retention days"}<br />
+                            {"Completed task retention days"}<br />
+                            <input
+                                type={"number"}
+                                name={"cleanup_completed_task_retention_days"}
+                                value={maybe_fill_value(&prev_values, "cleanup_completed_task_retention_days", Some(completed_task_retention_days.as_str()))}
+                                min={"1"}
+                                max={"30"}
+                                required={""}
+                            />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            {"Failed task retention days"}<br />
+                            <input
+                                type={"number"}
+                                name={"cleanup_failed_task_retention_days"}
+                                value={maybe_fill_value(&prev_values, "cleanup_failed_task_retention_days", Some(failed_task_retention_days.as_str()))}
+                                min={"1"}
+                                max={"365"}
+                                required={""}
+                            />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            {"Failed inbox payload compaction hours"}<br />
+                            <input
+                                type={"number"}
+                                name={"cleanup_failed_inbox_task_payload_compaction_hours"}
+                                value={maybe_fill_value(&prev_values, "cleanup_failed_inbox_task_payload_compaction_hours", Some(failed_inbox_payload_compaction_hours.as_str()))}
+                                min={"1"}
+                                max={"168"}
+                                required={""}
+                            />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            {"Failed inbox task row retention days"}<br />
                             <input
                                 type={"number"}
                                 name={"cleanup_failed_inbox_task_payload_retention_days"}
                                 value={maybe_fill_value(&prev_values, "cleanup_failed_inbox_task_payload_retention_days", Some(failed_inbox_payload_retention_days.as_str()))}
                                 min={"1"}
                                 max={"365"}
+                                required={""}
+                            />
+                        </label>
+                    </div>
+                </fieldset>
+                <fieldset>
+                    <legend>{"Discovery jobs"}</legend>
+                    <div>
+                        <label>
+                            {"Discovery batch size"}<br />
+                            <input
+                                type={"number"}
+                                name={"discovery_enqueue_limit"}
+                                value={maybe_fill_value(&prev_values, "discovery_enqueue_limit", Some(discovery_enqueue_limit.as_str()))}
+                                min={"10"}
+                                max={"500"}
+                                required={""}
+                            />
+                        </label>
+                    </div>
+                    <div>
+                        <label>
+                            {"Healthy host refresh interval hours"}<br />
+                            <input
+                                type={"number"}
+                                name={"discovery_refresh_interval_hours"}
+                                value={maybe_fill_value(&prev_values, "discovery_refresh_interval_hours", Some(discovery_refresh_interval_hours.as_str()))}
+                                min={"1"}
+                                max={"168"}
                                 required={""}
                             />
                         </label>
@@ -1352,7 +1708,7 @@ async fn handler_administration_logo_submit(
 
             let res = res_to_error(
                 ctx.http_client
-                    .request(for_client(
+                    .request_upload(for_client(
                         hyper::Request::post(format!("{}/api/unstable/media", ctx.backend_host))
                             .header(hyper::header::CONTENT_TYPE, mime.as_ref())
                             .body(hyper::Body::wrap_stream(stream))?,
@@ -1487,7 +1843,7 @@ async fn handler_administration_stylesheet_submit(
 
             let res = res_to_error(
                 ctx.http_client
-                    .request(for_client(
+                    .request_upload(for_client(
                         hyper::Request::post(format!(
                             "{}/api/unstable/instance/stylesheet",
                             ctx.backend_host,
@@ -1528,7 +1884,7 @@ async fn handler_administration_stylesheet_submit(
                         "{}/api/unstable/instance/stylesheet",
                         ctx.backend_host,
                     ))
-                    .body(Default::default())?,
+                    .body(hyper::Body::default())?,
                     &req_parts.headers,
                     &cookies,
                 )?)
@@ -1592,24 +1948,11 @@ async fn handler_administration_edit_submit(
         );
     }
 
-    for key in [
-        "cleanup_remote_posts_enabled",
-        "cleanup_preview_posts_enabled",
-        "cleanup_deleted_remote_communities_enabled",
-        "cleanup_unfollowed_remote_communities_enabled",
-        "cleanup_remote_interactions_enabled",
-        "cleanup_notifications_enabled",
-        "cleanup_failed_inbox_task_payloads_enabled",
-    ] {
+    for &key in ADMIN_BOOLEAN_SITE_SETTINGS {
         body.insert(key.into(), body_original.contains_key(key).into());
     }
 
-    for key in [
-        "cleanup_remote_post_retention_days",
-        "cleanup_preview_post_retention_hours",
-        "cleanup_notification_retention_days",
-        "cleanup_failed_inbox_task_payload_retention_days",
-    ] {
+    for &key in ADMIN_NUMERIC_SITE_SETTINGS {
         let value = match body.get(key).and_then(|x| x.as_str()) {
             Some(value) => value,
             None => {
@@ -1714,7 +2057,7 @@ async fn handler_administration_federation_task_retry(
                     "{}/api/unstable/instance/federation/tasks/{}/retry",
                     ctx.backend_host, task_id
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -1779,7 +2122,7 @@ mod tests {
     fn admin_diagnostic_summary_identifies_common_remote_failures() {
         assert_eq!(
             super::admin_diagnostic_summary(
-                "InternalStr(\"Error in remote response: {\\\"error\\\":\\\"unknown\\\",\\\"message\\\":\\\"Domain \\\\\\\"blocked.example\\\\\\\" is blocked\\\"}\")"
+                "InternalStr(\"Error in remote response: {\\\"error\\\":\\\"unknown\\\",\\\"message\\\":\\\"Domain \\\\\\\"lotide.example\\\\\\\" is blocked\\\"}\")"
             ),
             "Remote returned generic domain-block text"
         );
@@ -1842,5 +2185,77 @@ mod tests {
 
         assert!(summary.ends_with("..."));
         assert!(summary.len() < long.len());
+    }
+
+    #[test]
+    fn admin_failure_category_labels_are_human_readable() {
+        assert_eq!(
+            super::admin_failure_category_label(Some("domain_block")),
+            "domain block"
+        );
+        assert_eq!(super::admin_failure_category_label(Some("dns")), "DNS");
+        assert_eq!(
+            super::admin_failure_category_label(Some("bot_challenge")),
+            "bot challenge"
+        );
+        assert_eq!(super::admin_failure_category_label(None), "none");
+    }
+
+    #[test]
+    fn admin_catalog_status_labels_separate_fresh_and_stale_sources() {
+        assert_eq!(
+            super::admin_catalog_status_label(Some("useful_recent")),
+            "useful, recent catalog"
+        );
+        assert_eq!(
+            super::admin_catalog_status_label(Some("useful_stale")),
+            "useful, stale catalog"
+        );
+        assert_eq!(
+            super::admin_catalog_status_label(Some("verified_no_useful_catalog")),
+            "verified, no useful catalog"
+        );
+    }
+
+    #[test]
+    fn admin_followed_community_health_labels_are_operator_readable() {
+        assert_eq!(
+            super::admin_followed_community_health_label("missing_host_profile"),
+            "missing host profile"
+        );
+        assert_eq!(
+            super::admin_followed_community_health_label("no_visible_posts"),
+            "no visible posts"
+        );
+        assert_eq!(
+            super::admin_followed_community_health_label("catalog_stale"),
+            "catalog stale"
+        );
+        assert_eq!(super::admin_followed_community_health_label("ok"), "ok");
+    }
+
+    #[test]
+    fn admin_bytes_label_uses_small_readable_units() {
+        assert_eq!(super::admin_bytes_label(42), "42 B");
+        assert_eq!(super::admin_bytes_label(2048), "2.0 KiB");
+        assert_eq!(super::admin_bytes_label(5 * 1024 * 1024), "5.0 MiB");
+    }
+
+    #[test]
+    fn admin_submit_includes_task_and_discovery_settings() {
+        assert!(
+            super::ADMIN_BOOLEAN_SITE_SETTINGS
+                .contains(&"cleanup_failed_inbox_task_payloads_enabled")
+        );
+
+        for setting in [
+            "cleanup_completed_task_retention_days",
+            "cleanup_failed_task_retention_days",
+            "cleanup_failed_inbox_task_payload_compaction_hours",
+            "discovery_enqueue_limit",
+            "discovery_refresh_interval_hours",
+        ] {
+            assert!(super::ADMIN_NUMERIC_SITE_SETTINGS.contains(&setting));
+        }
     }
 }

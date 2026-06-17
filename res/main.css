@@ -708,7 +708,8 @@ main > ul > li small strong {
 }
 
 .communityMeta,
-.communityLastPost {
+.communityLastPost,
+.communityDiscoveryFreshness {
 	display: block;
 	margin-top: .18rem;
 	color: var(--muted);

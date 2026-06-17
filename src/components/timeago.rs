@@ -55,12 +55,10 @@ pub fn TimeAgo<'a>(
                     } else {
                         let seconds = duration.num_seconds();
 
-                        if seconds > 0 {
-                            lang::timeago_seconds(seconds)
-                        } else if seconds < 0 {
-                            lang::timeago_future()
-                        } else {
-                            lang::timeago_now()
+                        match seconds.cmp(&0) {
+                            std::cmp::Ordering::Greater => lang::timeago_seconds(seconds),
+                            std::cmp::Ordering::Less => lang::timeago_future(),
+                            std::cmp::Ordering::Equal => lang::timeago_now(),
                         }
                     }
                 }
@@ -80,7 +78,7 @@ mod tests {
 
     #[test]
     fn safe_time_ago_renders_bad_timestamps_without_panicking() {
-        let lang = crate::get_lang_for_headers(&Default::default());
+        let lang = crate::get_lang_for_headers(&crate::hyper::HeaderMap::default());
         let mut html = String::new();
 
         super::SafeTimeAgo {
@@ -96,7 +94,7 @@ mod tests {
 
     #[test]
     fn safe_time_ago_renders_valid_timestamps_as_timeago() {
-        let lang = crate::get_lang_for_headers(&Default::default());
+        let lang = crate::get_lang_for_headers(&crate::hyper::HeaderMap::default());
         let mut html = String::new();
 
         super::SafeTimeAgo {

@@ -1,6 +1,53 @@
 use serde_derive::Deserialize;
 use std::borrow::Cow;
 
+fn default_site_name<'a>() -> Cow<'a, str> {
+    Cow::Borrowed("lotide")
+}
+
+fn default_software<'a>() -> RespInstanceSoftwareInfo<'a> {
+    RespInstanceSoftwareInfo {
+        name: Cow::Borrowed("lotide"),
+        version: Cow::Borrowed("unknown"),
+    }
+}
+
+fn default_remote_post_retention_days() -> i32 {
+    90
+}
+
+fn default_preview_post_retention_hours() -> i32 {
+    2
+}
+
+fn default_notification_retention_days() -> i32 {
+    365
+}
+
+fn default_failed_inbox_task_payload_retention_days() -> i32 {
+    7
+}
+
+fn default_completed_task_retention_days() -> i32 {
+    3
+}
+
+fn default_failed_task_retention_days() -> i32 {
+    14
+}
+
+fn default_failed_inbox_task_payload_compaction_hours() -> i32 {
+    1
+}
+
+fn default_discovery_enqueue_limit() -> i32 {
+    100
+}
+
+fn default_discovery_refresh_interval_hours() -> i32 {
+    6
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -307,6 +354,16 @@ pub struct RespCommunityVisibilitySuppression {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct RespCommunityDiscoveryInfo<'a> {
+    #[serde(default)]
+    pub host: Option<Cow<'a, str>>,
+    #[serde(default)]
+    pub last_seen: Option<Cow<'a, str>>,
+    #[serde(default)]
+    pub server_last_success: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct RespCommunityInfoMaybeYour<'a> {
     #[serde(flatten)]
     pub base: RespMinimalCommunityInfo<'a>,
@@ -318,6 +375,8 @@ pub struct RespCommunityInfoMaybeYour<'a> {
     pub your_follow: Option<RespYourFollow>,
     pub last_post: Option<RespCommunityLastPostInfo<'a>>,
     pub remote_post_count: Option<i64>,
+    #[serde(default)]
+    pub discovery: Option<RespCommunityDiscoveryInfo<'a>>,
     pub latest_unfollow_status: Option<RespFederationStatus>,
     pub visibility_suppression: Option<RespCommunityVisibilitySuppression>,
     pub pending_moderation_actions: Option<u32>,
@@ -376,29 +435,11 @@ pub struct RespInstanceSoftwareInfo<'a> {
     pub version: Cow<'a, str>,
 }
 
-fn default_site_name<'a>() -> Cow<'a, str> {
-    Cow::Borrowed("lotide")
-}
-
-fn default_cleanup_remote_post_retention_days() -> i32 {
-    30
-}
-
-fn default_cleanup_preview_post_retention_hours() -> i32 {
-    24
-}
-
-fn default_cleanup_notification_retention_days() -> i32 {
-    90
-}
-
-fn default_cleanup_failed_inbox_task_payload_retention_days() -> i32 {
-    30
-}
-
 #[derive(Deserialize, Debug)]
 pub struct RespInstanceInfo<'a> {
+    #[serde(default)]
     pub description: Content<'a>,
+    #[serde(default = "default_software")]
     pub software: RespInstanceSoftwareInfo<'a>,
     #[serde(default = "default_site_name")]
     pub site_name: Cow<'a, str>,
@@ -406,17 +447,21 @@ pub struct RespInstanceInfo<'a> {
     pub site_logo: Option<JustURL<'a>>,
     #[serde(default)]
     pub site_css: Option<JustURL<'a>>,
+    #[serde(default)]
     pub signup_allowed: bool,
+    #[serde(default)]
     pub invitations_enabled: bool,
+    #[serde(default)]
     pub community_creation_requirement: Option<Cow<'a, str>>,
+    #[serde(default)]
     pub invitation_creation_requirement: Option<Cow<'a, str>>,
     #[serde(default)]
     pub cleanup_remote_posts_enabled: bool,
-    #[serde(default = "default_cleanup_remote_post_retention_days")]
+    #[serde(default = "default_remote_post_retention_days")]
     pub cleanup_remote_post_retention_days: i32,
     #[serde(default)]
     pub cleanup_preview_posts_enabled: bool,
-    #[serde(default = "default_cleanup_preview_post_retention_hours")]
+    #[serde(default = "default_preview_post_retention_hours")]
     pub cleanup_preview_post_retention_hours: i32,
     #[serde(default)]
     pub cleanup_deleted_remote_communities_enabled: bool,
@@ -426,13 +471,24 @@ pub struct RespInstanceInfo<'a> {
     pub cleanup_remote_interactions_enabled: bool,
     #[serde(default)]
     pub cleanup_notifications_enabled: bool,
-    #[serde(default = "default_cleanup_notification_retention_days")]
+    #[serde(default = "default_notification_retention_days")]
     pub cleanup_notification_retention_days: i32,
     #[serde(default)]
     pub cleanup_failed_inbox_task_payloads_enabled: bool,
-    #[serde(default = "default_cleanup_failed_inbox_task_payload_retention_days")]
+    #[serde(default = "default_failed_inbox_task_payload_retention_days")]
     pub cleanup_failed_inbox_task_payload_retention_days: i32,
+    #[serde(default = "default_completed_task_retention_days")]
+    pub cleanup_completed_task_retention_days: i32,
+    #[serde(default = "default_failed_task_retention_days")]
+    pub cleanup_failed_task_retention_days: i32,
+    #[serde(default = "default_failed_inbox_task_payload_compaction_hours")]
+    pub cleanup_failed_inbox_task_payload_compaction_hours: i32,
+    #[serde(default = "default_discovery_enqueue_limit")]
+    pub discovery_enqueue_limit: i32,
+    #[serde(default = "default_discovery_refresh_interval_hours")]
+    pub discovery_refresh_interval_hours: i32,
 
+    #[serde(default)]
     pub web_push_vapid_key: Cow<'a, str>,
 }
 
@@ -450,15 +506,23 @@ pub struct RespAdminHostProfile {
     pub interaction_probe_checked_at: Option<String>,
     pub interaction_probe_success_at: Option<String>,
     pub interaction_probe_latest_error: Option<String>,
+    #[serde(default)]
+    pub failure_category: Option<String>,
     pub discovered_communities_total: i64,
     pub discovered_communities_active: i64,
     pub discovered_communities_with_posts: i64,
+    #[serde(default)]
+    pub useful_community_source: bool,
     pub communities_total: i64,
     pub followed_communities_total: i64,
     pub actor_profiles_total: i64,
     pub high_confidence_actor_profiles_total: i64,
     pub recent_events_total: i64,
     pub recent_failures_total: i64,
+    #[serde(default)]
+    pub newest_community_seen: Option<String>,
+    #[serde(default)]
+    pub catalog_status: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -471,11 +535,41 @@ pub struct RespAdminFederationSummary {
     pub discovered_communities_total: i64,
     pub discovered_communities_active: i64,
     pub discovered_communities_with_posts: i64,
+    #[serde(default)]
+    pub discovered_communities_visible: i64,
+    #[serde(default)]
+    pub discovery_servers_useful_sources: i64,
+    #[serde(default)]
+    pub discovery_servers_known_only: i64,
+    #[serde(default)]
+    pub discovery_servers_due: i64,
     pub actor_target_profiles_total: i64,
     pub blocked_ap_ids_total: i64,
     pub server_suppressed_communities_total: i64,
     pub user_suppressed_communities_total: i64,
     pub federation_events_total: i64,
+    #[serde(default)]
+    pub task_pending_total: i64,
+    #[serde(default)]
+    pub task_running_total: i64,
+    #[serde(default)]
+    pub task_failed_total: i64,
+    #[serde(default)]
+    pub task_completed_total: i64,
+    #[serde(default)]
+    pub task_oldest_pending: Option<String>,
+    #[serde(default)]
+    pub task_table_bytes: i64,
+    #[serde(default)]
+    pub task_pending_outbound: i64,
+    #[serde(default)]
+    pub task_pending_inbox: i64,
+    #[serde(default)]
+    pub task_pending_discovery: i64,
+    #[serde(default)]
+    pub task_pending_preview: i64,
+    #[serde(default)]
+    pub task_pending_readback: i64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -492,6 +586,8 @@ pub struct RespAdminFederationServer {
     pub interaction_probe_checked_at: Option<String>,
     pub interaction_probe_success_at: Option<String>,
     pub interaction_probe_latest_error: Option<String>,
+    #[serde(default)]
+    pub failure_category: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -575,11 +671,33 @@ pub struct RespAdminFederationReplayableTask {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct RespAdminFederationFollowedCommunityHealth {
+    pub community_id: i64,
+    pub community_name: String,
+    pub community_ap_id: Option<String>,
+    pub host: String,
+    pub software: Option<String>,
+    pub host_active: Option<bool>,
+    pub host_failed_checks: Option<i32>,
+    pub latest_error: Option<String>,
+    pub suppressed_reason: Option<String>,
+    pub last_success: Option<String>,
+    pub local_followers: i64,
+    pub visible_posts: i64,
+    pub last_post: Option<String>,
+    pub remote_post_count: i64,
+    pub catalog_last_seen: Option<String>,
+    pub health_status: String,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct RespAdminFederationHealth {
     pub summary: RespAdminFederationSummary,
     pub suppressed_servers: Vec<RespAdminFederationServer>,
     pub failing_servers: Vec<RespAdminFederationServer>,
     pub host_profiles: Vec<RespAdminHostProfile>,
+    #[serde(default)]
+    pub followed_community_health: Vec<RespAdminFederationFollowedCommunityHealth>,
     pub blocked_ap_ids: Vec<RespAdminFederationBlockedApId>,
     pub server_suppressed_communities: Vec<RespAdminFederationServerSuppressedCommunity>,
     pub user_suppressed_communities: Vec<RespAdminFederationUserSuppressedCommunity>,
@@ -686,7 +804,7 @@ pub struct RespNotification<'a> {
     pub unseen: bool,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
 pub struct Content<'a> {
     pub content_text: Option<Cow<'a, str>>,
     pub content_markdown: Option<Cow<'a, str>>,
@@ -712,6 +830,122 @@ pub struct JustContentText<'a> {
 #[derive(Deserialize, Debug)]
 pub struct JustContentHTML<'a> {
     pub content_html: Cow<'a, str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_info_accepts_missing_newer_settings() {
+        let info: RespInstanceInfo<'_> = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(info.site_name.as_ref(), "lotide");
+        assert_eq!(info.software.name.as_ref(), "lotide");
+        assert_eq!(info.software.version.as_ref(), "unknown");
+        assert!(info.site_logo.is_none());
+        assert!(info.site_css.is_none());
+        assert!(!info.cleanup_remote_posts_enabled);
+        assert_eq!(info.cleanup_remote_post_retention_days, 90);
+        assert_eq!(info.cleanup_preview_post_retention_hours, 2);
+        assert_eq!(info.cleanup_notification_retention_days, 365);
+        assert_eq!(info.cleanup_failed_inbox_task_payload_retention_days, 7);
+        assert_eq!(info.cleanup_completed_task_retention_days, 3);
+        assert_eq!(info.cleanup_failed_task_retention_days, 14);
+        assert_eq!(info.cleanup_failed_inbox_task_payload_compaction_hours, 1);
+    }
+
+    #[test]
+    fn federation_summary_accepts_missing_task_metrics() {
+        let summary: RespAdminFederationSummary = serde_json::from_str(
+            r#"{
+                "discovery_servers_total": 0,
+                "discovery_servers_active": 0,
+                "discovery_servers_inactive": 0,
+                "discovery_servers_suppressed": 0,
+                "discovery_servers_probe_success": 0,
+                "discovered_communities_total": 0,
+                "discovered_communities_active": 0,
+                "discovered_communities_with_posts": 0,
+                "actor_target_profiles_total": 0,
+                "blocked_ap_ids_total": 0,
+                "server_suppressed_communities_total": 0,
+                "user_suppressed_communities_total": 0,
+                "federation_events_total": 0
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(summary.task_pending_total, 0);
+        assert_eq!(summary.task_running_total, 0);
+        assert_eq!(summary.task_failed_total, 0);
+        assert_eq!(summary.task_completed_total, 0);
+        assert!(summary.task_oldest_pending.is_none());
+        assert_eq!(summary.task_table_bytes, 0);
+        assert_eq!(summary.task_pending_outbound, 0);
+        assert_eq!(summary.task_pending_inbox, 0);
+        assert_eq!(summary.task_pending_discovery, 0);
+        assert_eq!(summary.task_pending_preview, 0);
+        assert_eq!(summary.task_pending_readback, 0);
+    }
+
+    #[test]
+    fn federation_health_accepts_missing_followed_community_health() {
+        let health: RespAdminFederationHealth = serde_json::from_str(
+            r#"{
+                "summary": {
+                    "discovery_servers_total": 0,
+                    "discovery_servers_active": 0,
+                    "discovery_servers_inactive": 0,
+                    "discovery_servers_suppressed": 0,
+                    "discovery_servers_probe_success": 0,
+                    "discovered_communities_total": 0,
+                    "discovered_communities_active": 0,
+                    "discovered_communities_with_posts": 0,
+                    "actor_target_profiles_total": 0,
+                    "blocked_ap_ids_total": 0,
+                    "server_suppressed_communities_total": 0,
+                    "user_suppressed_communities_total": 0,
+                    "federation_events_total": 0
+                },
+                "suppressed_servers": [],
+                "failing_servers": [],
+                "host_profiles": [],
+                "blocked_ap_ids": [],
+                "server_suppressed_communities": [],
+                "user_suppressed_communities": [],
+                "actor_profile_families": [],
+                "recent_actor_profiles": [],
+                "recent_events": [],
+                "replayable_failed_tasks": []
+            }"#,
+        )
+        .unwrap();
+
+        assert!(health.followed_community_health.is_empty());
+    }
+
+    #[test]
+    fn instance_info_keeps_theme_fields_when_present() {
+        let info: RespInstanceInfo<'_> = serde_json::from_str(
+            r#"{
+                "site_name": "Example Lotide",
+                "site_logo": {"url": "/api/stable/instance/logo"},
+                "site_css": {"url": "/api/stable/instance/stylesheet"}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(info.site_name.as_ref(), "Example Lotide");
+        assert_eq!(
+            info.site_logo.unwrap().url.as_ref(),
+            "/api/stable/instance/logo"
+        );
+        assert_eq!(
+            info.site_css.unwrap().url.as_ref(),
+            "/api/stable/instance/stylesheet"
+        );
+    }
 }
 
 #[derive(Deserialize, Debug)]

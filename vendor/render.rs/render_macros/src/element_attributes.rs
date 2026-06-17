@@ -78,7 +78,7 @@ pub struct CustomElementAttributes<'a, 'c> {
     children: &'c Children,
 }
 
-impl<'a, 'c> ToTokens for CustomElementAttributes<'a, 'c> {
+impl ToTokens for CustomElementAttributes<'_, '_> {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         let mut attrs: Vec<_> = self
             .attributes
@@ -114,7 +114,7 @@ pub struct SimpleElementAttributes<'a> {
     attributes: &'a Attributes,
 }
 
-impl<'a> ToTokens for SimpleElementAttributes<'a> {
+impl ToTokens for SimpleElementAttributes<'_> {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         if self.attributes.is_empty() {
             quote!(None).to_tokens(tokens);

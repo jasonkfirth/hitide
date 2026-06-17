@@ -60,7 +60,7 @@ pub struct HttpClient {
 
 impl HttpClient {
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-    const STREAMING_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+    const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
     pub fn new() -> Self {
         Self {
@@ -72,18 +72,23 @@ impl HttpClient {
         &self,
         request: hyper::Request<hyper::Body>,
     ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
-        /*
-            Requests with an unknown request-body length are usually browser
-            uploads being streamed to Lotide. Give those requests a larger
-            envelope so slow but active uploads are not killed by the normal
-            backend response timeout.
-        */
-        let timeout = if request.body().size_hint().upper().is_none() {
-            Self::STREAMING_REQUEST_TIMEOUT
-        } else {
-            Self::REQUEST_TIMEOUT
-        };
+        self.request_with_timeout(request, Self::REQUEST_TIMEOUT)
+            .await
+    }
 
+    pub async fn request_upload(
+        &self,
+        request: hyper::Request<hyper::Body>,
+    ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+        self.request_with_timeout(request, Self::UPLOAD_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        request: hyper::Request<hyper::Body>,
+        timeout: Duration,
+    ) -> Result<hyper::Response<hyper::Body>, crate::Error> {
         tokio::time::timeout(timeout, self.inner.request(request))
             .await
             .map_err(|_| {
@@ -96,7 +101,7 @@ impl HttpClient {
     }
 
     pub async fn get(&self, uri: hyper::Uri) -> Result<hyper::Response<hyper::Body>, crate::Error> {
-        self.request(hyper::Request::get(uri).body(Default::default())?)
+        self.request(hyper::Request::get(uri).body(hyper::Body::default())?)
             .await
     }
 }
@@ -156,13 +161,14 @@ pub async fn read_body_with_timeout(body: hyper::Body) -> Result<Vec<u8>, Error>
 
 fn response_for_route_error(err: Error) -> hyper::Response<hyper::Body> {
     /*
-        Keep the public error text useful. Backend reachability and backend 5xx
-        failures point at Lotide; unexpected local render or routing errors point
-        at Hitide. Detailed diagnostics stay in the logs.
+        Keep the public error text actionable. Backend reachability and backend
+        5xx failures point at Lotide; unexpected local render or routing errors
+        point at Hitide. Detailed diagnostics stay in the logs.
 
-        This path cannot rely on the backend for page settings, since the backend
-        might be down. It uses a small local fallback identity while rendering
-        the same HTML shell and CSS as other error pages.
+        This path cannot rely on the backend for page settings, since the most
+        common failure is that the backend is unavailable. The themed error page
+        therefore uses a small local fallback identity while still rendering the
+        same HTML shell and CSS as the rest of the site.
     */
     match err {
         Error::UserError(res) => res,
@@ -260,6 +266,15 @@ pub struct PageBaseData {
 }
 
 impl PageBaseData {
+    pub fn fallback(login: Option<RespLoginInfo>) -> Self {
+        Self {
+            login,
+            site_name: "lotide".to_owned(),
+            site_logo_url: None,
+            site_css_url: None,
+        }
+    }
+
     pub fn is_site_admin(&self) -> bool {
         match &self.login {
             None => false,
@@ -277,6 +292,23 @@ pub fn simple_response(
     res
 }
 
+pub fn parse_query_string<'de, T>(query: Option<&'de str>) -> Result<T, Error>
+where
+    T: serde::Deserialize<'de>,
+{
+    /*
+        Browser query strings are public input. A malformed enum or number is a
+        bad request, not a frontend failure, and logging the original value can
+        turn simple scanner noise into very large log lines.
+    */
+    serde_urlencoded::from_str(query.unwrap_or("")).map_err(|_| {
+        Error::UserError(simple_response(
+            hyper::StatusCode::BAD_REQUEST,
+            "Invalid query string.",
+        ))
+    })
+}
+
 fn themed_error_response(
     code: hyper::StatusCode,
     title: impl Into<String>,
@@ -289,12 +321,7 @@ fn themed_error_response(
         |reason| format!("{} {}", code.as_u16(), reason),
     );
     let lang = get_lang_for_headers(&hyper::HeaderMap::new());
-    let base_data = PageBaseData {
-        login: None,
-        site_name: "lotide".to_owned(),
-        site_logo_url: None,
-        site_css_url: None,
-    };
+    let base_data = PageBaseData::fallback(None);
 
     let mut res = hyper::Response::new(
         render::html! {
@@ -383,11 +410,109 @@ pub fn bool_as_str(src: bool) -> &'static str {
     if src { "true" } else { "false" }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct CliArgs {
+    config_file_path: Option<std::ffi::OsString>,
+}
+
+fn help_text(program_name: &str) -> String {
+    /*
+        Hitide has intentionally simple process management. Keep the help text
+        plain enough for service files and shell scripts while still spelling
+        out the backend/frontend split that trips up new installs.
+    */
+    format!(
+        "\
+hitide {version}
+
+Server-rendered web frontend for Lotide.
+
+Usage:
+  {program_name} [OPTIONS]
+
+Options:
+  -c, --config <FILE>    Read configuration from an INI file
+  -h, --help             Print this help text
+  -V, --version          Print version information
+
+Configuration:
+  BACKEND_HOST           Lotide backend URL, for example http://127.0.0.1:3333
+  FRONTEND_URL           Public Hitide URL, for example https://example.com
+  PORT                   TCP port to listen on, default 4333
+  BIND_ADDRESS           Listen address, default 127.0.0.1
+  HITIDE_*               Any setting can also be provided with this prefix
+
+Examples:
+  {program_name} -c /etc/hitide.ini
+  BACKEND_HOST=http://127.0.0.1:3333 FRONTEND_URL=https://example.com {program_name}
+",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn version_text() -> String {
+    format!("hitide {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn parse_cli_args_from<I, S>(args: I) -> Result<Option<CliArgs>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let mut args = args.into_iter();
+    let _program_name = args.next();
+    let mut config_file_path = None;
+
+    while let Some(arg) = args.next() {
+        let arg = arg.into();
+        let Some(arg_str) = arg.to_str() else {
+            return Err("Command-line arguments must be valid Unicode".to_owned());
+        };
+
+        match arg_str {
+            "-h" | "--help" => {
+                println!("{}", help_text("hitide"));
+                return Ok(None);
+            }
+            "-V" | "--version" => {
+                println!("{}", version_text());
+                return Ok(None);
+            }
+            "-c" | "--config" => {
+                let Some(path) = args.next() else {
+                    return Err(format!("Missing value for {arg_str}"));
+                };
+
+                config_file_path = Some(path.into());
+            }
+            _ if arg_str.starts_with("--config=") => {
+                let value = arg_str.trim_start_matches("--config=");
+
+                if value.is_empty() {
+                    return Err("Missing value for --config".to_owned());
+                }
+
+                config_file_path = Some(value.into());
+            }
+            _ => return Err(format!("Unknown option: {arg_str}")),
+        }
+    }
+
+    Ok(Some(CliArgs { config_file_path }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let config = Config::load().expect("Failed to load config");
+    let Some(cli_args) = parse_cli_args_from(std::env::args_os()).map_err(|message| {
+        eprintln!("{message}\n\n{}", help_text("hitide"));
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+    })?
+    else {
+        return Ok(());
+    };
+    let config = Config::load(cli_args.config_file_path.as_deref()).expect("Failed to load config");
     let listen_addr = std::net::SocketAddr::new(config.bind_address, config.port);
 
     let routes = Arc::new(routes::route_root());
@@ -449,6 +574,46 @@ mod tests {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
+    #[test]
+    fn help_text_documents_frontend_runtime_settings() {
+        let help = super::help_text("hitide");
+
+        assert!(help.contains("Server-rendered web frontend for Lotide"));
+        assert!(help.contains("-c, --config <FILE>"));
+        assert!(help.contains("BACKEND_HOST"));
+        assert!(help.contains("FRONTEND_URL"));
+        assert!(help.contains("BIND_ADDRESS"));
+        assert!(help.contains("HITIDE_*"));
+    }
+
+    #[test]
+    fn cli_parser_accepts_config_options() {
+        let args = super::parse_cli_args_from(["hitide", "-c", "/etc/hitide.ini"])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            args.config_file_path.as_deref(),
+            Some(std::ffi::OsStr::new("/etc/hitide.ini"))
+        );
+
+        let args = super::parse_cli_args_from(["hitide", "--config=/etc/hitide.ini"])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            args.config_file_path.as_deref(),
+            Some(std::ffi::OsStr::new("/etc/hitide.ini"))
+        );
+    }
+
+    #[test]
+    fn cli_parser_rejects_missing_config_value() {
+        let err = super::parse_cli_args_from(["hitide", "--config"]).unwrap_err();
+
+        assert!(err.contains("Missing value for --config"));
+    }
+
     #[tokio::test]
     async fn bounded_body_reader_accepts_small_bodies() {
         let body = super::read_body_limited(hyper::Body::from("small"), 8)
@@ -470,6 +635,35 @@ mod tests {
             }
             err => panic!("unexpected error: {:?}", err),
         }
+    }
+
+    #[test]
+    fn query_parser_rejects_invalid_public_input_as_bad_request() {
+        #[derive(Debug, serde_derive::Deserialize)]
+        struct Query {
+            sort: super::SortType,
+        }
+
+        let err = super::parse_query_string::<Query>(Some("sort=not_a_sort")).unwrap_err();
+
+        match err {
+            super::Error::UserError(response) => {
+                assert_eq!(response.status(), hyper::StatusCode::BAD_REQUEST);
+            }
+            err => panic!("unexpected error: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn query_parser_accepts_valid_public_input() {
+        #[derive(Debug, serde_derive::Deserialize)]
+        struct Query {
+            sort: super::SortType,
+        }
+
+        let query = super::parse_query_string::<Query>(Some("sort=new")).unwrap();
+
+        assert_eq!(query.sort, super::SortType::New);
     }
 
     fn assert_themed_error_headers(response: &hyper::Response<hyper::Body>) {
@@ -529,6 +723,19 @@ mod tests {
             assert_themed_error_headers(&response);
             assert_themed_error_body(response, "No backend").await;
         }
+    }
+
+    #[test]
+    fn upload_requests_have_a_longer_timeout_than_page_requests() {
+        assert!(super::HttpClient::UPLOAD_REQUEST_TIMEOUT > super::HttpClient::REQUEST_TIMEOUT);
+        assert_eq!(
+            super::HttpClient::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            super::HttpClient::UPLOAD_REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(5 * 60)
+        );
     }
 
     #[tokio::test]

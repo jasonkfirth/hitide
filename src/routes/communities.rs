@@ -362,7 +362,7 @@ async fn page_communities(
         sort: Option<Cow<'a, str>>,
     }
 
-    let query: Query = serde_urlencoded::from_str(req.uri().query().unwrap_or(""))?;
+    let query: Query = crate::parse_query_string(req.uri().query())?;
     let default_scope = if base_data.login.is_some() {
         "mine"
     } else {
@@ -420,7 +420,7 @@ async fn page_communities(
                         ctx.backend_host,
                         serde_urlencoded::to_string(&api_query)?,
                     ))
-                    .body(Default::default())?,
+                    .body(hyper::Body::default())?,
                     req.headers(),
                     &cookies,
                 )?)
@@ -647,6 +647,47 @@ async fn page_communities(
                                 &lang,
                                 community.visibility_suppression.as_ref(),
                             );
+                            let discovery_last_seen = community
+                                .discovery
+                                .as_ref()
+                                .and_then(|discovery| discovery.last_seen.as_deref());
+                            let discovery_host = community
+                                .discovery
+                                .as_ref()
+                                .and_then(|discovery| discovery.host.as_deref());
+                            let discovery_server_last_success = community
+                                .discovery
+                                .as_ref()
+                                .and_then(|discovery| discovery.server_last_success.as_deref());
+                            let discovery_text = match (
+                                discovery_last_seen,
+                                discovery_server_last_success,
+                                discovery_host,
+                            ) {
+                                (Some(last_seen), Some(server_last_success), Some(host)) => {
+                                    Some(format!(
+                                        "Seen in {host} directory {last_seen}; host checked {server_last_success}"
+                                    ))
+                                }
+                                (Some(last_seen), Some(server_last_success), None) => {
+                                    Some(format!(
+                                        "Seen in directory {last_seen}; host checked {server_last_success}"
+                                    ))
+                                }
+                                (Some(last_seen), None, Some(host)) => {
+                                    Some(format!("Seen in {host} directory {last_seen}"))
+                                }
+                                (Some(last_seen), None, None) => {
+                                    Some(format!("Seen in directory {last_seen}"))
+                                }
+                                (None, Some(server_last_success), Some(host)) => {
+                                    Some(format!("Host {host} checked {server_last_success}"))
+                                }
+                                (None, Some(server_last_success), None) => {
+                                    Some(format!("Host checked {server_last_success}"))
+                                }
+                                (None, None, _) => None,
+                            };
 
                             render::rsx! {
                                 <li>
@@ -664,6 +705,15 @@ async fn page_communities(
                                             }
                                         </small>
                                         <small class={"communityLastPost"}>{last_post_text}</small>
+                                        {
+                                            discovery_text.map(|discovery_text| {
+                                                render::rsx! {
+                                                    <small class={"communityDiscoveryFreshness"}>
+                                                        {discovery_text}
+                                                    </small>
+                                                }
+                                            })
+                                        }
                                         {
                                             visibility_notice.map(|visibility_notice| {
                                                 render::rsx! {
@@ -749,7 +799,7 @@ async fn page_community(
         page: Option<Cow<'a, str>>,
     }
 
-    let query: Query = serde_urlencoded::from_str(req.uri().query().unwrap_or(""))?;
+    let query: Query = crate::parse_query_string(req.uri().query())?;
 
     let lang = crate::get_lang_for_req(&req);
     let cookies = get_cookie_map_for_req(&req)?;
@@ -772,7 +822,7 @@ async fn page_community(
                         ""
                     },
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -800,7 +850,7 @@ async fn page_community(
                         ..Default::default()
                     })?,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -1089,7 +1139,7 @@ async fn page_community_edit_inner(
                     "{}/api/unstable/communities/{}",
                     ctx.backend_host, community_id,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 headers,
                 cookies,
             )?)
@@ -1200,7 +1250,7 @@ async fn page_community_delete(
                     "{}/api/unstable/communities/{}",
                     ctx.backend_host, community_id
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -1302,7 +1352,7 @@ async fn handler_communities_unfollow_inactive(
                     "{}/api/unstable/communities/unfollow_inactive",
                     ctx.backend_host
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -1356,7 +1406,7 @@ async fn page_community_moderators_inner(
                         ""
                     },
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 headers,
                 cookies,
             )?)
@@ -1375,7 +1425,7 @@ async fn page_community_moderators_inner(
                     "{}/api/unstable/communities/{}/moderators",
                     ctx.backend_host, community_id,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 headers,
                 cookies,
             )?)
@@ -1491,7 +1541,7 @@ async fn handler_community_moderators_add(
                         username: &body.username,
                     })?,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 &req_parts.headers,
                 &cookies,
             )?)
@@ -1517,7 +1567,7 @@ async fn handler_community_moderators_add(
                                     "{}/api/unstable/communities/{}/moderators/{}",
                                     ctx.backend_host, community_id, target_user.base.id,
                                 ))
-                                .body(Default::default())?,
+                                .body(hyper::Body::default())?,
                                 &req_parts.headers,
                                 &cookies,
                             )?)
@@ -1578,7 +1628,7 @@ async fn handler_community_moderators_remove(
                     "{}/api/unstable/communities/{}/moderators/{}",
                     ctx.backend_host, community_id, body.user,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 &req_parts.headers,
                 &cookies,
             )?)
@@ -1629,7 +1679,7 @@ async fn page_community_modlog(
                     "{}/api/unstable/communities/{}/modlog/events",
                     ctx.backend_host, community_id,
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -1820,7 +1870,7 @@ async fn handler_community_unfollow(
                     "{}/api/unstable/communities/{}/unfollow",
                     ctx.backend_host, community_id
                 ))
-                .body(Default::default())?,
+                .body(hyper::Body::default())?,
                 req.headers(),
                 &cookies,
             )?)
@@ -2036,7 +2086,7 @@ async fn handler_communities_new_post_submit(
                             log::debug!("will upload media");
                             let res = res_to_error(
                                 ctx.http_client
-                                    .request(for_client(
+                                    .request_upload(for_client(
                                         hyper::Request::post(format!(
                                             "{}/api/unstable/media",
                                             ctx.backend_host,
