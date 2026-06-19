@@ -2,13 +2,40 @@
 
 All notable local changes to this Hitide fork are recorded here.
 
-## 0.17.1 - 2026-06-11
+## 0.18.0 - 2026-06-18
 
-### Release Follow-up - 2026-06-17
+### Runtime Follow-up - 2026-06-18
 
+- Rendered source profile summaries as sanitized HTML and replaced a broken
+  source-link glyph with the same plain arrow used elsewhere in the UI.
+- Added compact source summaries to source-list rows and an explicit empty
+  preview state for sources that report items but expose no preview rows.
+- Marked all dynamic HTML responses as non-storable so browsers and reverse
+  proxies do not keep stale source, community, or post pages after live changes.
+- Added native source-item pages so cached blog posts, profile posts, media
+  entries, and bookmarks can be read in Hitide before opening the original site.
+- Changed the messages inbox to a per-user conversation list, with latest
+  message previews and dismiss controls that hide a conversation until new
+  activity arrives.
+- Rendered visible federation status badges on direct-message previews and
+  conversation entries, matching the post, comment, like, and follow views.
+- Treated small future timestamps as "now" in relative time labels so normal
+  remote server clock skew does not make new federated messages look broken.
+- Fixed the direct-message reply form so its empty textarea always emits a real
+  closing tag instead of letting the browser treat the rest of the form as text.
+- Replaced the bare header "Messages" text link with a generated envelope icon
+  and localized accessible label.
+- Added a simple server-rendered messages area for direct conversations,
+  including conversation threads, send forms, profile-page message links, and
+  direct-message notification rendering.
 - Added a short backend connection-pool idle timeout so Hitide reconnects
   quickly after a Lotide backend restart instead of waiting for a full page
   request timeout on stale pooled sockets.
+- Added source-preview Like capability handling so source pages can disable
+  the upvote control when the backend knows the remote platform does not accept
+  Like activities.
+- Reworked admin byte-count formatting to use integer arithmetic instead of
+  floating point conversion.
 
 ### Release Hygiene - 2026-06-16
 
@@ -48,7 +75,7 @@ All notable local changes to this Hitide fork are recorded here.
 ### Changed
 
 - Updated the project to Rust 2024 and bumped the local release version to
-  `0.17.1`.
+  `0.18.0`.
 - Modernized the HTTP stack to Hyper 1, `http` 1, `headers` 0.4,
   `hyper-util`, and `http-body-util`.
 - Reworked backend request handling so connection failures are reported as
@@ -87,6 +114,11 @@ All notable local changes to this Hitide fork are recorded here.
 - Added route and render tests for backend failure pages.
 - Added render tests for federation status, community listing, admin
   diagnostics, malformed timestamps, and missing optional backend data.
+- Added response-contract coverage for source-preview Like capability flags and
+  expanded admin byte formatter tests.
 - Ran stricter Clippy passes with warnings denied after the HTTP modernization.
+- Raised the strict Clippy gate with
+  `clippy::redundant_closure_for_method_calls` on top of the existing
+  high-signal lint set.
 
 <!-- end of CHANGELOG.md -->

@@ -29,7 +29,7 @@ pub use ::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 
 use bytes::Bytes;
 use futures_util::TryStreamExt as _;
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt as _, Empty, Full, StreamBody};
+use http_body_util::{BodyExt as _, Empty, Full, StreamBody, combinators::UnsyncBoxBody};
 use hyper1::body::Body as HyperBody;
 use std::fmt;
 use std::pin::Pin;

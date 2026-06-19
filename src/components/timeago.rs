@@ -28,7 +28,16 @@ pub fn TimeAgo<'a>(
 ) {
     let since_str = since.to_rfc3339();
 
-    let duration = chrono::offset::Utc::now().signed_duration_since(since);
+    let mut duration = chrono::offset::Utc::now().signed_duration_since(since);
+
+    /*
+        Remote servers sometimes publish objects a few minutes ahead of our
+        local clock. Treat small future offsets as "now" so ordinary clock
+        skew does not make fresh posts look broken.
+    */
+    if duration < chrono::Duration::zero() && duration > chrono::Duration::minutes(-15) {
+        duration = chrono::Duration::zero();
+    }
 
     let arg = {
         let weeks = duration.num_weeks();
@@ -106,5 +115,24 @@ mod tests {
 
         assert!(html.contains("2026-01-01T00:00:00+00:00"));
         assert!(!html.contains("&lt;"));
+    }
+
+    #[test]
+    fn safe_time_ago_treats_small_future_clock_skew_as_now() {
+        let lang = crate::get_lang_for_headers(&crate::hyper::HeaderMap::default());
+        let since = (chrono::offset::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        let mut html = String::new();
+
+        super::SafeTimeAgo {
+            since: &since,
+            lang: &lang,
+        }
+        .render_into(&mut html)
+        .unwrap();
+
+        assert!(
+            !html.contains("in the future"),
+            "small clock skew should not render as a future timestamp: {html}"
+        );
     }
 }

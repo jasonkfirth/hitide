@@ -213,22 +213,37 @@ fn admin_followed_community_health_label(value: &str) -> &'static str {
 
 fn admin_bytes_label(bytes: i64) -> String {
     let units = ["B", "KiB", "MiB", "GiB"];
-    let mut value = bytes.max(0) as f64;
-    let mut unit = units[0];
+    let bytes = u64::try_from(bytes).unwrap_or(0);
+    let mut divisor = 1_u64;
+    let mut unit_index = 0_usize;
 
-    for next_unit in units.iter().skip(1) {
-        if value < 1024.0 {
+    while unit_index + 1 < units.len() {
+        let Some(next_divisor) = divisor.checked_mul(1024) else {
+            break;
+        };
+
+        if bytes < next_divisor {
             break;
         }
 
-        value /= 1024.0;
-        unit = next_unit;
+        divisor = next_divisor;
+        unit_index += 1;
     }
 
-    if unit == "B" {
-        format!("{} {}", bytes.max(0), unit)
+    let unit = units[unit_index];
+    if unit_index == 0 {
+        format!("{bytes} {unit}")
     } else {
-        format!("{value:.1} {unit}")
+        let mut whole = bytes / divisor;
+        let remainder = bytes % divisor;
+        let mut decimal = ((remainder * 10) + (divisor / 2)) / divisor;
+
+        if decimal == 10 {
+            whole = whole.saturating_add(1);
+            decimal = 0;
+        }
+
+        format!("{whole}.{decimal} {unit}")
     }
 }
 
@@ -512,7 +527,7 @@ async fn page_administration(
                     {" suppressed"}
                 </li>
                 <li>
-                    {"Community sources: "}
+                    {"Community discovery hosts: "}
                     <strong>{federation_res.summary.discovery_servers_useful_sources.to_string()}</strong>
                     {" useful, "}
                     <strong>{federation_res.summary.discovery_servers_known_only.to_string()}</strong>
@@ -802,7 +817,7 @@ async fn page_administration(
                         <th>{"Host"}</th>
                         <th>{"Software"}</th>
                         <th>{"Health"}</th>
-                        <th>{"Source"}</th>
+                        <th>{"Profile origin"}</th>
                         <th>{"Communities"}</th>
                         <th>{"Actor profiles"}</th>
                         <th>{"Recent events"}</th>
@@ -1169,6 +1184,21 @@ async fn page_administration(
     }))
 }
 
+fn administration_description_edit_value<'a>(
+    description: crate::resp_types::Content<'a>,
+) -> (Cow<'a, str>, &'static str) {
+    match description.content_markdown {
+        Some(content) => (content, "markdown"),
+        None => match description.content_html {
+            Some(content) => (content, "html"),
+            None => (
+                description.content_text.unwrap_or(Cow::Borrowed("")),
+                "text",
+            ),
+        },
+    }
+}
+
 async fn page_administration_edit(
     _params: (),
     ctx: Arc<crate::RouteContext>,
@@ -1245,13 +1275,8 @@ async fn page_administration_edit_inner(
     let discovery_enqueue_limit = api_res.discovery_enqueue_limit.to_string();
     let discovery_refresh_interval_hours = api_res.discovery_refresh_interval_hours.to_string();
 
-    let (description_content, description_format) = match api_res.description.content_markdown {
-        Some(content) => (content, "markdown"),
-        None => match api_res.description.content_html {
-            Some(content) => (content, "html"),
-            None => (api_res.description.content_text.unwrap(), "text"),
-        },
-    };
+    let (description_content, description_format) =
+        administration_description_edit_value(api_res.description);
 
     Ok(html_response(render::html! {
         <HTPage base_data={&base_data} lang={&lang} title={&title}>
@@ -2218,6 +2243,40 @@ mod tests {
     }
 
     #[test]
+    fn admin_description_edit_value_tolerates_empty_backend_description() {
+        let empty = crate::resp_types::Content::default();
+        let text = crate::resp_types::Content {
+            content_text: Some(std::borrow::Cow::Borrowed("plain")),
+            ..Default::default()
+        };
+        let html = crate::resp_types::Content {
+            content_html: Some(std::borrow::Cow::Borrowed("<p>html</p>")),
+            ..Default::default()
+        };
+        let markdown = crate::resp_types::Content {
+            content_markdown: Some(std::borrow::Cow::Borrowed("**markdown**")),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::administration_description_edit_value(empty),
+            ("".into(), "text")
+        );
+        assert_eq!(
+            super::administration_description_edit_value(text),
+            ("plain".into(), "text")
+        );
+        assert_eq!(
+            super::administration_description_edit_value(html),
+            ("<p>html</p>".into(), "html")
+        );
+        assert_eq!(
+            super::administration_description_edit_value(markdown),
+            ("**markdown**".into(), "markdown")
+        );
+    }
+
+    #[test]
     fn admin_followed_community_health_labels_are_operator_readable() {
         assert_eq!(
             super::admin_followed_community_health_label("missing_host_profile"),
@@ -2236,9 +2295,11 @@ mod tests {
 
     #[test]
     fn admin_bytes_label_uses_small_readable_units() {
+        assert_eq!(super::admin_bytes_label(-1), "0 B");
         assert_eq!(super::admin_bytes_label(42), "42 B");
         assert_eq!(super::admin_bytes_label(2048), "2.0 KiB");
         assert_eq!(super::admin_bytes_label(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(super::admin_bytes_label(1536 * 1024 * 1024), "1.5 GiB");
     }
 
     #[test]

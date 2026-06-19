@@ -51,6 +51,7 @@ login_signup = Aŭ { $part_signup }
 login_signup_part_signup = krei novan konton
 lookup_nothing = Nenio troveblas.
 lookup_title = Serĉi
+messages = Mesaĝoj
 moderators = Kontrolantoj
 name_prompt = Nomo:
 no_cancel = Ne, nuligi

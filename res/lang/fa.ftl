@@ -88,6 +88,7 @@ logout = خروج
 lookup_nothing = چیزی پیدا نشد.
 lookup_title = گشتن
 missing_permission_create_invitation = شما مجاز به ایجاد دعوت‌نامه نیستید
+messages = پیام‌ها
 moderation_dashboard = پیش‌خوان نظارت
 moderation_dashboard_some = پیش‌خوان نظارت (کارهایی برای انجام هست)
 moderators = ناظرها

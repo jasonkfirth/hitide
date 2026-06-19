@@ -49,6 +49,7 @@ login_signup = Oder { $part_signup }
 login_signup_part_signup = Erstelle neuen Account
 lookup_nothing = Nichts gefunden.
 lookup_title = Nachschlaten
+messages = Nachrichten
 moderators = Moderatoren
 name_prompt = Name:
 no_cancel = Nein, abbrechen

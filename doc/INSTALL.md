@@ -5,7 +5,7 @@ the Lotide backend through `BACKEND_HOST`. It does not own the database,
 ActivityPub inboxes, migrations, media storage, or background tasks.
 
 This guide documents the direct Debian source-tree install used by the live
-production instance. There are also helper scripts under `build_scripts/` that install
+reference instance. There are also helper scripts under `build_scripts/` that install
 a conventional `/usr/local/bin` layout, but the direct `/var/hitide` layout is
 the one described here because it matches the wrapper script and systemd unit
 that are known to start the current service successfully.
@@ -72,7 +72,7 @@ sudo git clone https://git.sr.ht/~vpzom/hitide/ hitide
 sudo chown -R lotide:lotide /var/hitide
 ```
 
-If you are deploying this locally maintained tree instead of the public upstream,
+If you are deploying this maintained tree instead of the public upstream,
 copy or clone that tree into `/var/hitide` and keep the same ownership.
 
 ## Build

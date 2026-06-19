@@ -12,6 +12,10 @@ fn default_software<'a>() -> RespInstanceSoftwareInfo<'a> {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_remote_post_retention_days() -> i32 {
     90
 }
@@ -164,6 +168,24 @@ pub struct RespMinimalCommentInfo<'a> {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct RespPrivateMessageInfo<'a> {
+    pub id: i64,
+    #[serde(borrow)]
+    pub author: RespMinimalAuthorInfo<'a>,
+    #[serde(borrow)]
+    pub recipient: RespMinimalAuthorInfo<'a>,
+    pub created: Cow<'a, str>,
+    pub local: bool,
+    pub remote_url: Option<Cow<'a, str>>,
+    pub content_text: Option<Cow<'a, str>>,
+    pub content_markdown: Option<Cow<'a, str>>,
+    pub content_html: Option<Cow<'a, str>>,
+    pub in_reply_to: Option<i64>,
+    pub federation_status: Option<RespFederationStatus>,
+    pub sensitive: bool,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct RespThingComment<'a> {
     #[serde(flatten)]
     pub base: RespMinimalCommentInfo<'a>,
@@ -280,6 +302,8 @@ pub struct RespUserInfo<'a> {
     pub description: Content<'a>,
     pub suspended: Option<bool>,
     pub your_note: Option<JustContentText<'a>>,
+    #[serde(default)]
+    pub your_follow: Option<RespYourFollow>,
 }
 
 impl<'a> AsRef<RespMinimalAuthorInfo<'a>> for RespUserInfo<'a> {
@@ -407,6 +431,8 @@ pub struct RespCollectionTargetPreviewItem<'a> {
     pub summary_html: Option<Cow<'a, str>>,
     pub image_url: Option<Cow<'a, str>>,
     pub published: Option<Cow<'a, str>>,
+    #[serde(default)]
+    pub your_vote: Option<RespYourVote>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -425,8 +451,83 @@ pub struct RespCollectionTargetInfo<'a> {
     pub total_items: Option<i64>,
     pub your_follow: Option<RespYourFollow>,
     pub latest_unfollow_status: Option<RespFederationStatus>,
+    #[serde(default = "default_true")]
+    pub preview_item_likes_supported: bool,
     #[serde(default)]
     pub preview_items: Vec<RespCollectionTargetPreviewItem<'a>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespCollectionTargetItemCollection<'a> {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub kind: Cow<'a, str>,
+    pub software: Option<Cow<'a, str>>,
+    pub name: Cow<'a, str>,
+    pub remote_url: Cow<'a, str>,
+    pub owner: RespCollectionTargetOwner<'a>,
+    #[serde(default = "default_true")]
+    pub preview_item_likes_supported: bool,
+    #[serde(default)]
+    pub preview_item_replies_supported: bool,
+    #[serde(default)]
+    pub can_reply: bool,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespCollectionTargetItemComment<'a> {
+    pub id: i64,
+    pub remote_url: Option<Cow<'a, str>>,
+    pub content_text: Option<Cow<'a, str>>,
+    pub content_markdown: Option<Cow<'a, str>>,
+    pub content_html: Option<Cow<'a, str>>,
+    pub created: Cow<'a, str>,
+    pub local: bool,
+    pub author: Option<RespMinimalAuthorInfo<'a>>,
+    pub sensitive: bool,
+    pub federation_status: Option<RespFederationStatus>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespCollectionTargetItemInfo<'a> {
+    pub collection: RespCollectionTargetItemCollection<'a>,
+    pub item: RespCollectionTargetPreviewItem<'a>,
+    #[serde(default)]
+    pub comments: Vec<RespCollectionTargetItemComment<'a>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespCollectionTargetListItem<'a> {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub kind: Cow<'a, str>,
+    pub software: Cow<'a, str>,
+    pub name: Cow<'a, str>,
+    pub remote_url: Cow<'a, str>,
+    pub owner: RespCollectionTargetOwner<'a>,
+    pub total_items: Option<i64>,
+    pub preview_item_count: i64,
+    pub latest_preview_item: Option<Cow<'a, str>>,
+    pub latest_preview_published: Option<Cow<'a, str>>,
+    pub latest_preview_url: Option<Cow<'a, str>>,
+    pub summary_excerpt: Option<Cow<'a, str>>,
+    pub your_follow: Option<RespYourFollow>,
+    pub latest_unfollow_status: Option<RespFederationStatus>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespCollectionTargetSoftwareCount<'a> {
+    pub software: Cow<'a, str>,
+    pub count: i64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RespCollectionTargetList<'a> {
+    pub items: Vec<RespCollectionTargetListItem<'a>>,
+    pub next_page: Option<Cow<'a, str>>,
+    pub total_count: i64,
+    pub scope_total_count: i64,
+    pub software_counts: Vec<RespCollectionTargetSoftwareCount<'a>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -791,6 +892,10 @@ pub enum RespNotificationInfo<'a> {
     UserFollow {
         user: RespMinimalAuthorInfo<'a>,
     },
+    PrivateMessage {
+        #[serde(borrow)]
+        message: RespPrivateMessageInfo<'a>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -945,6 +1050,223 @@ mod tests {
             info.site_css.unwrap().url.as_ref(),
             "/api/stable/instance/stylesheet"
         );
+    }
+
+    #[test]
+    fn collection_target_list_accepts_source_discovery_contract() {
+        let list: RespCollectionTargetList<'_> = serde_json::from_str(
+            r#"{
+                "items": [{
+                    "id": 12,
+                    "type": "actor_feed",
+                    "software": "castopod",
+                    "name": "The Show",
+                    "remote_url": "https://podcasts.example/@show",
+                    "owner": {
+                        "id": null,
+                        "remote_url": "https://podcasts.example/@show"
+                    },
+                    "total_items": 42,
+                    "preview_item_count": 3,
+                    "latest_preview_item": "Episode 1",
+                    "latest_preview_published": "2026-06-18T12:00:00Z",
+                    "latest_preview_url": "https://podcasts.example/episodes/1",
+                    "summary_excerpt": "A compact source summary",
+                    "your_follow": {
+                        "accepted": false,
+                        "federation_status": "sent"
+                    },
+                    "latest_unfollow_status": null
+                }],
+                "next_page": null,
+                "total_count": 1,
+                "scope_total_count": 1,
+                "software_counts": [{
+                    "software": "castopod",
+                    "count": 1
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(list.items[0].software.as_ref(), "castopod");
+        assert_eq!(
+            list.items[0].summary_excerpt.as_deref(),
+            Some("A compact source summary")
+        );
+        assert_eq!(
+            list.items[0]
+                .your_follow
+                .as_ref()
+                .unwrap()
+                .federation_status,
+            Some(RespFederationStatus::Sent)
+        );
+        assert_eq!(list.software_counts[0].software.as_ref(), "castopod");
+    }
+
+    #[test]
+    fn collection_target_info_defaults_preview_likes_to_supported() {
+        let target: RespCollectionTargetInfo<'_> = serde_json::from_str(
+            r#"{
+                "id": 12,
+                "type": "actor_feed",
+                "software": "postmarks",
+                "name": "Bookmarks",
+                "remote_url": "https://bookmarks.example/u/links",
+                "owner": {
+                    "id": null,
+                    "remote_url": "https://bookmarks.example/u/links"
+                },
+                "followers": null,
+                "first_page": "https://bookmarks.example/u/links/outbox?page=1",
+                "last_page": null,
+                "summary_html": null,
+                "total_items": 10,
+                "your_follow": null,
+                "latest_unfollow_status": null,
+                "preview_items": []
+            }"#,
+        )
+        .unwrap();
+
+        assert!(target.preview_item_likes_supported);
+
+        let target: RespCollectionTargetInfo<'_> = serde_json::from_str(
+            r#"{
+                "id": 12,
+                "type": "actor_feed",
+                "software": "postmarks",
+                "name": "Bookmarks",
+                "remote_url": "https://bookmarks.example/u/links",
+                "owner": {
+                    "id": null,
+                    "remote_url": "https://bookmarks.example/u/links"
+                },
+                "followers": null,
+                "first_page": "https://bookmarks.example/u/links/outbox?page=1",
+                "last_page": null,
+                "summary_html": null,
+                "total_items": 10,
+                "your_follow": null,
+                "latest_unfollow_status": null,
+                "preview_item_likes_supported": false,
+                "preview_items": []
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!target.preview_item_likes_supported);
+    }
+
+    #[test]
+    fn collection_target_item_info_accepts_native_reader_contract() {
+        let item: RespCollectionTargetItemInfo<'_> = serde_json::from_str(
+            r#"{
+                "collection": {
+                    "id": 12,
+                    "type": "actor_feed",
+                    "software": "wordpress",
+                    "name": "A Blog",
+                    "remote_url": "https://blog.example/ap/actor",
+                    "owner": {
+                        "id": null,
+                        "remote_url": "https://blog.example/ap/actor"
+                    },
+                    "preview_item_likes_supported": true,
+                    "preview_item_replies_supported": true,
+                    "can_reply": true
+                },
+                "item": {
+                    "id": 44,
+                    "ap_id": "https://blog.example/posts/1",
+                    "type": "Article",
+                    "name": "Readable source item",
+                    "url": "https://blog.example/readable-source-item",
+                    "attributed_to": "https://blog.example/ap/actor",
+                    "content_html": "<p>Cached body.</p>",
+                    "summary_html": null,
+                    "image_url": "https://blog.example/cover.jpg",
+                    "published": "2026-06-19T12:00:00Z",
+                    "your_vote": null
+                },
+                "comments": [{
+                    "id": 6,
+                    "remote_url": "https://lotide.example/apub/collection_targets/12/items/44/comments/6",
+                    "content_text": null,
+                    "content_markdown": "Good post.",
+                    "content_html": "<p>Good post.</p>",
+                    "created": "2026-06-19T12:30:00Z",
+                    "local": true,
+                    "author": {
+                        "id": 1,
+                        "username": "alice",
+                        "local": true,
+                        "host": "lotide.example",
+                        "remote_url": "https://lotide.example/apub/users/1",
+                        "avatar": null,
+                        "is_bot": false
+                    },
+                    "sensitive": false,
+                    "federation_status": "received"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(item.collection.name.as_ref(), "A Blog");
+        assert!(item.collection.preview_item_replies_supported);
+        assert!(item.collection.can_reply);
+        assert_eq!(item.item.name.as_ref(), "Readable source item");
+        assert_eq!(
+            item.item.content_html.as_deref(),
+            Some("<p>Cached body.</p>")
+        );
+        assert_eq!(
+            item.comments[0].federation_status,
+            Some(RespFederationStatus::Received)
+        );
+    }
+
+    #[test]
+    fn private_message_info_accepts_federation_status_contract() {
+        let message: RespPrivateMessageInfo<'_> = serde_json::from_str(
+            r#"{
+                "id": 33,
+                "author": {
+                    "id": 1,
+                    "username": "me",
+                    "local": true,
+                    "host": "lotide.example",
+                    "remote_url": "https://lotide.example/apub/users/1",
+                    "is_bot": false
+                },
+                "recipient": {
+                    "id": 2,
+                    "username": "remote",
+                    "local": false,
+                    "host": "remote.example",
+                    "remote_url": "https://remote.example/users/remote",
+                    "is_bot": false
+                },
+                "created": "2026-06-18T12:00:00Z",
+                "local": true,
+                "remote_url": "https://lotide.example/apub/private_messages/33",
+                "content_text": "hello",
+                "content_markdown": null,
+                "content_html": "<p>hello</p>",
+                "in_reply_to": null,
+                "federation_status": "received",
+                "sensitive": false
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            message.federation_status,
+            Some(RespFederationStatus::Received)
+        );
+        assert_eq!(message.content_html.as_deref(), Some("<p>hello</p>"));
     }
 }
 

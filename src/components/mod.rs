@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use crate::PageBaseData;
 use crate::lang;
 use crate::resp_types::{
-    Content, RespCommentInfo, RespFederationStatus, RespFlagDetails, RespFlagInfo,
-    RespMinimalAuthorInfo, RespMinimalCommentInfo, RespMinimalCommunityInfo, RespNotification,
-    RespNotificationInfo, RespPollInfo, RespPostCommentInfo, RespPostInfo, RespPostListPost,
+    Content, RespCollectionTargetItemComment, RespCommentInfo, RespFederationStatus,
+    RespFlagDetails, RespFlagInfo, RespMinimalAuthorInfo, RespMinimalCommentInfo,
+    RespMinimalCommunityInfo, RespNotification, RespNotificationInfo, RespPollInfo,
+    RespPostCommentInfo, RespPostInfo, RespPostListPost, RespPrivateMessageInfo,
     RespSiteModlogEvent, RespSiteModlogEventDetails, RespThingComment, RespThingInfo,
     RespYourFollow,
 };
@@ -377,6 +378,25 @@ impl HavingContent for RespCommentInfo<'_> {
     }
 }
 
+impl HavingContent for RespPrivateMessageInfo<'_> {
+    fn content_text(&self) -> Option<&str> {
+        self.content_text.as_deref()
+    }
+    fn content_html(&self) -> Option<&str> {
+        self.content_html.as_deref()
+    }
+}
+
+impl HavingContent for RespCollectionTargetItemComment<'_> {
+    fn content_text(&self) -> Option<&str> {
+        self.content_text.as_deref()
+    }
+
+    fn content_html(&self) -> Option<&str> {
+        self.content_html.as_deref()
+    }
+}
+
 impl HavingContent for RespPostInfo<'_> {
     fn content_text(&self) -> Option<&str> {
         self.content_text.as_deref()
@@ -515,6 +535,7 @@ pub fn HTPageAdvanced<'a, HeadItems: render::Render, Children: render::Render>(
             <a href={"/all"}>{lang.tr(&lang::ALL)}</a>
             <a href={"/local"}>{lang.tr(&lang::LOCAL)}</a>
             <a href={"/communities"}>{lang.tr(&lang::COMMUNITIES)}</a>
+            <a href={"/sources"}>{"Feeds"}</a>
             <a href={"/about"}>{lang.tr(&lang::ABOUT)}</a>
         </>
     };
@@ -587,6 +608,9 @@ pub fn HTPageAdvanced<'a, HeadItems: render::Render, Children: render::Render>(
                                                         hitide_icons::NOTIFICATIONS.img(lang.tr(&lang::notifications()).into_owned())
                                                     }
                                                 }
+                                            </a>
+                                            <a href={"/messages"}>
+                                                {hitide_icons::MESSAGES.img(lang.tr(&lang::messages()).into_owned())}
                                             </a>
                                             <a href={format!("/users/{}", login.user.id)}>
                                                 {hitide_icons::PERSON.img(lang.tr(&lang::profile()).into_owned())}
@@ -1180,6 +1204,26 @@ impl render::Render for NotificationItem<'_> {
                             )
                         }
                     </div>
+                })
+                .render_into(writer)?;
+            }
+            RespNotificationInfo::PrivateMessage { message } => {
+                (render::rsx! {
+                    <>
+                        <div>
+                            {"New private message from "}
+                            <UserLink lang user={Some(&message.author)} />
+                            {" ("}
+                            <a href={format!("/messages/users/{}", message.author.id)}>{"open conversation"}</a>
+                            {")"}
+                        </div>
+                        <div class={"body"}>
+                            <small>
+                                <SafeTimeAgo since={message.created.as_ref()} lang />
+                            </small>
+                            <ContentView src={message} />
+                        </div>
+                    </>
                 })
                 .render_into(writer)?;
             }

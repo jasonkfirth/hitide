@@ -8,16 +8,17 @@ use std::sync::Arc;
 
 use crate::PageBaseData;
 use crate::components::{
-    BoolCheckbox, ContentView, FlagItem, FollowFederationStatusBadge, HTPage, MaybeFillInput,
-    NotificationItem, PostItem, SiteModlogEventItem, ThingItem, UserAvatar,
-    federation_status_line_class,
+    BoolCheckbox, ContentView, FederationStatusBadge, FlagItem, FollowFederationStatusBadge,
+    HTPage, IconExt, MaybeFillInput, NotificationItem, PostItem, SafeTimeAgo, SiteModlogEventItem,
+    ThingItem, UserAvatar, UserLink, federation_status_line_class,
 };
 use crate::lang;
 use crate::query_types::{FlagListQuery, PostListQuery};
 use crate::resp_types::{
-    InvitationsCreateResponse, JustStringID, RespCollectionTargetInfo, RespFlagInfo,
-    RespInstanceInfo, RespInvitationInfo, RespList, RespNotification, RespPostListPost,
-    RespSiteModlogEvent, RespThingInfo, RespUserInfo,
+    InvitationsCreateResponse, JustStringID, RespCollectionTargetInfo,
+    RespCollectionTargetItemInfo, RespCollectionTargetList, RespCollectionTargetSoftwareCount,
+    RespFlagInfo, RespInstanceInfo, RespInvitationInfo, RespList, RespNotification,
+    RespPostListPost, RespPrivateMessageInfo, RespSiteModlogEvent, RespThingInfo, RespUserInfo,
 };
 use crate::util::safe_href;
 
@@ -194,17 +195,17 @@ fn html_response(html: String) -> hyper::Response<hyper::Body> {
         hyper::header::CONTENT_TYPE,
         hyper::header::HeaderValue::from_static("text/html"),
     );
+    set_uncached_dynamic_headers(&mut res);
     res
 }
 
-fn uncached_html_response(html: String) -> hyper::Response<hyper::Body> {
+fn set_uncached_dynamic_headers(res: &mut hyper::Response<hyper::Body>) {
     /*
-        Discussion pages change under a stable URL whenever replies, votes, or
-        moderation state changes. The reverse proxy may otherwise serve a page
-        that was correct a few seconds ago but is now missing a just-created
-        local comment.
+        Hitide pages are thin views over live Lotide state. Even public pages
+        can change after discovery, follows, votes, source preview refreshes,
+        moderation, or remote inbox delivery, so dynamic HTML should never be
+        stored by the browser or a caching proxy.
     */
-    let mut res = html_response(html);
     res.headers_mut().insert(
         hyper::header::CACHE_CONTROL,
         hyper::header::HeaderValue::from_static(
@@ -223,7 +224,10 @@ fn uncached_html_response(html: String) -> hyper::Response<hyper::Body> {
         "Surrogate-Control",
         hyper::header::HeaderValue::from_static("no-store"),
     );
-    res
+}
+
+fn uncached_html_response(html: String) -> hyper::Response<hyper::Body> {
+    html_response(html)
 }
 
 fn cache_invalidating_response(
@@ -652,6 +656,674 @@ async fn page_lookup(
     }
 }
 
+fn sources_url(
+    search: Option<&str>,
+    scope: &str,
+    page: Option<i64>,
+    software: Option<&str>,
+    sort: Option<&str>,
+) -> Result<String, crate::Error> {
+    #[derive(Serialize)]
+    struct Query<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search: Option<&'a str>,
+        scope: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        page: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        software: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sort: Option<&'a str>,
+    }
+
+    let query = serde_urlencoded::to_string(Query {
+        search,
+        scope,
+        page,
+        software: software.filter(|software| *software != "all"),
+        sort: sort.filter(|sort| *sort != "alphabetic"),
+    })?;
+
+    if query.is_empty() {
+        Ok("/sources".to_owned())
+    } else {
+        Ok(format!("/sources?{query}"))
+    }
+}
+
+enum SourcesPaginationItem {
+    Page {
+        page: i64,
+        href: Option<String>,
+        current: bool,
+    },
+    Gap,
+}
+
+struct SourcesPagination {
+    items: Vec<SourcesPaginationItem>,
+}
+
+impl render::Render for SourcesPagination {
+    fn render_into<W: std::fmt::Write + ?Sized>(self, writer: &mut W) -> std::fmt::Result {
+        if self.items.len() <= 1 {
+            return Ok(());
+        }
+
+        write!(
+            writer,
+            "<nav class=\"pagination\" aria-label=\"Feed pages\">"
+        )?;
+
+        for item in self.items {
+            match item {
+                SourcesPaginationItem::Page {
+                    page,
+                    href,
+                    current,
+                } => {
+                    if current {
+                        write!(writer, "<span aria-current=\"page\">{page}</span>")?;
+                    } else if let Some(href) = href {
+                        write!(writer, "<a href=\"")?;
+                        render::html_escaping::escape_html(&href, writer)?;
+                        write!(writer, "\">{page}</a>")?;
+                    }
+                }
+                SourcesPaginationItem::Gap => {
+                    write!(writer, "<span class=\"paginationGap\">...</span>")?;
+                }
+            }
+        }
+
+        write!(writer, "</nav>")
+    }
+}
+
+fn sources_page_numbers(current_page: i64, has_next_page: bool) -> Vec<Option<i64>> {
+    let current_page = current_page.max(1);
+    let mut pages = vec![Some(1)];
+    let first_window_page = (current_page - 2).max(2);
+
+    if first_window_page > 2 {
+        pages.push(None);
+    }
+
+    for page in first_window_page..=current_page {
+        if page != 1 {
+            pages.push(Some(page));
+        }
+    }
+
+    if has_next_page {
+        pages.push(Some(current_page + 1));
+    }
+
+    pages
+}
+
+fn render_sources_pagination(
+    search: Option<&str>,
+    scope: &str,
+    current_page: i64,
+    has_next_page: bool,
+    software: Option<&str>,
+    sort: Option<&str>,
+) -> Result<SourcesPagination, crate::Error> {
+    let current_page = current_page.max(1);
+    let mut items = Vec::new();
+
+    for page in sources_page_numbers(current_page, has_next_page) {
+        match page {
+            Some(page) => {
+                let href = if page == current_page {
+                    None
+                } else {
+                    let query_page = if page > 1 { Some(page) } else { None };
+
+                    sources_url(search, scope, query_page, software, sort).map(Some)?
+                };
+
+                items.push(SourcesPaginationItem::Page {
+                    page,
+                    href,
+                    current: page == current_page,
+                });
+            }
+            None => items.push(SourcesPaginationItem::Gap),
+        }
+    }
+
+    Ok(SourcesPagination { items })
+}
+
+fn normalize_source_software(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("all") {
+        "all" => "all",
+        "funkwhale" | "funkwhale_library" => "funkwhale",
+        "wordpress" => "wordpress",
+        "wordpress_event_bridge" => "wordpress_event_bridge",
+        "flipboard" => "flipboard",
+        "fedigroups" | "fedigroup" => "fedigroups",
+        "fedibird_group" => "fedibird_group",
+        "buzzrelay" => "buzzrelay",
+        "guppe" => "guppe",
+        "ap_groups" => "ap_groups",
+        "group_actor" => "group_actor",
+        "tootgroup" => "tootgroup",
+        "mobilizon" => "mobilizon",
+        "gancio" => "gancio",
+        "bonfire" => "bonfire",
+        "writefreely" => "writefreely",
+        "postmarks" => "postmarks",
+        "owncast" => "owncast",
+        "castopod" => "castopod",
+        "bookwyrm" => "bookwyrm",
+        "pixelfed" => "pixelfed",
+        "gotosocial" => "gotosocial",
+        "misskey" => "misskey",
+        "sharkey" => "sharkey",
+        "iceshrimp" => "iceshrimp",
+        "snac" => "snac",
+        "mitra" => "mitra",
+        "wafrn" => "wafrn",
+        "unknown" => "unknown",
+        _ => "all",
+    }
+}
+
+fn source_software_label(software: &str) -> Cow<'static, str> {
+    match software {
+        "all" => Cow::Borrowed("All"),
+        "funkwhale" => Cow::Borrowed("Funkwhale"),
+        "wordpress" => Cow::Borrowed("WordPress"),
+        "wordpress_event_bridge" => Cow::Borrowed("WordPress Event Bridge"),
+        "flipboard" => Cow::Borrowed("Flipboard"),
+        "fedigroups" => Cow::Borrowed("FediGroups"),
+        "fedibird_group" => Cow::Borrowed("Fedibird Group"),
+        "buzzrelay" => Cow::Borrowed("BuzzRelay"),
+        "guppe" => Cow::Borrowed("Guppe"),
+        "ap_groups" => Cow::Borrowed("AP-Groups"),
+        "group_actor" => Cow::Borrowed("Group Actor"),
+        "tootgroup" => Cow::Borrowed("tootgroup.py"),
+        "mobilizon" => Cow::Borrowed("Mobilizon"),
+        "gancio" => Cow::Borrowed("Gancio"),
+        "bonfire" => Cow::Borrowed("Bonfire"),
+        "writefreely" => Cow::Borrowed("WriteFreely"),
+        "postmarks" => Cow::Borrowed("Postmarks"),
+        "owncast" => Cow::Borrowed("Owncast"),
+        "castopod" => Cow::Borrowed("Castopod"),
+        "bookwyrm" => Cow::Borrowed("BookWyrm"),
+        "pixelfed" => Cow::Borrowed("Pixelfed"),
+        "gotosocial" => Cow::Borrowed("GoToSocial"),
+        "misskey" => Cow::Borrowed("Misskey"),
+        "sharkey" => Cow::Borrowed("Sharkey"),
+        "iceshrimp" => Cow::Borrowed("Iceshrimp"),
+        "snac" => Cow::Borrowed("snac"),
+        "mitra" => Cow::Borrowed("Mitra"),
+        "wafrn" => Cow::Borrowed("wafrn"),
+        "unknown" => Cow::Borrowed("Unclassified"),
+        other => Cow::Owned(other.replace('_', " ")),
+    }
+}
+
+fn source_kind_label(kind: &str) -> Cow<'static, str> {
+    match kind {
+        "funkwhale_library" => Cow::Borrowed("Library"),
+        "ordered_collection" | "OrderedCollection" => Cow::Borrowed("Ordered collection"),
+        "collection" | "Collection" => Cow::Borrowed("Collection"),
+        "actor_feed" => Cow::Borrowed("Actor feed"),
+        "group" | "Group" => Cow::Borrowed("Group"),
+        "service" | "Service" => Cow::Borrowed("Service"),
+        other => Cow::Owned(other.replace('_', " ")),
+    }
+}
+
+fn source_capability_labels(kind: &str, software: &str) -> Vec<&'static str> {
+    /*
+        Not every federated "place" is an ActivityPub Group. Funkwhale
+        libraries, blog actors, and group relay services all expect slightly
+        different interaction shapes, so the UI names the affordances from the
+        model Lotide is actually using for that feed.
+    */
+    match (kind, software) {
+        ("funkwhale_library", _) | (_, "funkwhale") => {
+            vec!["follow library", "preview tracks", "owner inbox"]
+        }
+        (
+            _,
+            "fedigroups" | "fedibird_group" | "buzzrelay" | "guppe" | "ap_groups" | "tootgroup",
+        ) => {
+            vec!["follow relay", "receive boosts", "public posts"]
+        }
+        (_, "wordpress" | "writefreely" | "postmarks") => {
+            vec!["follow author", "read posts", "send replies"]
+        }
+        (_, "flipboard") => vec!["follow magazine", "read articles"],
+        (_, "owncast") => vec!["follow stream", "live notices", "read posts"],
+        (_, "castopod") => vec!["follow podcast", "preview episodes", "send replies"],
+        (_, "gancio" | "mobilizon" | "wordpress_event_bridge") => {
+            vec!["follow events", "preview events", "send replies"]
+        }
+        (_, "bookwyrm") => vec!["follow reader", "preview reviews", "send replies"],
+        (_, "pixelfed") => vec!["follow account", "preview images", "send replies"],
+        (_, "gotosocial" | "misskey" | "sharkey" | "iceshrimp" | "snac" | "mitra" | "wafrn") => {
+            vec!["follow account", "preview posts", "send replies"]
+        }
+        ("group" | "Group", _) => vec!["follow group", "read posts"],
+        _ => vec!["follow", "preview"],
+    }
+}
+
+fn normalize_source_sort(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("alphabetic") {
+        "latest" => "latest",
+        "items" => "items",
+        "software" => "software",
+        _ => "alphabetic",
+    }
+}
+
+fn source_sort_label(sort: &str) -> &'static str {
+    match sort {
+        "latest" => "Latest preview",
+        "items" => "Most items",
+        "software" => "Software",
+        _ => "Alphabetical",
+    }
+}
+
+fn sources_count_text(scope: &str, count: i64, search_active: bool) -> String {
+    let count = count.max(0);
+
+    match (scope, count, search_active) {
+        ("mine", 1, false) => "1 followed feed".to_owned(),
+        ("mine", 1, true) => "1 matching followed feed".to_owned(),
+        ("mine", _, false) => format!("{count} followed feeds"),
+        ("mine", _, true) => format!("{count} matching followed feeds"),
+        (_, 1, false) => "1 feed".to_owned(),
+        (_, 1, true) => "1 matching feed".to_owned(),
+        (_, _, false) => format!("{count} feeds"),
+        (_, _, true) => format!("{count} matching feeds"),
+    }
+}
+
+async fn page_sources(
+    (): (),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    #[derive(Deserialize, Serialize)]
+    struct Query<'a> {
+        search: Option<Cow<'a, str>>,
+        scope: Option<Cow<'a, str>>,
+        page: Option<i64>,
+        software: Option<Cow<'a, str>>,
+        sort: Option<Cow<'a, str>>,
+    }
+
+    let lang = crate::get_lang_for_req(&req);
+    let cookies = get_cookie_map_for_req(&req)?;
+    let base_data =
+        fetch_base_data(&ctx.backend_host, &ctx.http_client, req.headers(), &cookies).await?;
+    let query: Query = crate::parse_query_string(req.uri().query())?;
+    let default_scope = if base_data.login.is_some() {
+        "mine"
+    } else {
+        "everything"
+    };
+    let scope = match query.scope.as_deref() {
+        Some("mine") if base_data.login.is_some() => "mine",
+        Some("everything") => "everything",
+        _ => default_scope,
+    };
+    let current_page = query.page.filter(|page| *page > 0).unwrap_or(1);
+    let software = normalize_source_software(query.software.as_deref());
+    let software_for_api = if software == "all" {
+        None
+    } else {
+        Some(software)
+    };
+    let sort = normalize_source_sort(query.sort.as_deref());
+
+    #[derive(Serialize)]
+    struct ApiQuery<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search: Option<&'a str>,
+        scope: &'a str,
+        include_your: bool,
+        limit: i64,
+        page_number: i64,
+        sort: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        software: Option<&'a str>,
+    }
+
+    let api_query = ApiQuery {
+        search: query.search.as_deref(),
+        scope,
+        include_your: base_data.login.is_some(),
+        limit: 150,
+        page_number: current_page,
+        sort,
+        software: software_for_api,
+    };
+
+    let api_res = crate::read_body_with_timeout(
+        res_to_error(
+            ctx.http_client
+                .request(for_client(
+                    hyper::Request::get(format!(
+                        "{}/api/unstable/collection_targets?{}",
+                        ctx.backend_host,
+                        serde_urlencoded::to_string(&api_query)?,
+                    ))
+                    .body(hyper::Body::default())?,
+                    req.headers(),
+                    &cookies,
+                )?)
+                .await?,
+        )
+        .await?
+        .into_body(),
+    )
+    .await?;
+    let sources: RespCollectionTargetList = serde_json::from_slice(&api_res)?;
+    let search_for_links = query
+        .search
+        .as_deref()
+        .filter(|search| !search.trim().is_empty());
+    let sources_count_text =
+        sources_count_text(scope, sources.total_count, search_for_links.is_some());
+    let title = "Feeds";
+    let filter_options = &[
+        ("mine", "mine", base_data.login.is_some()),
+        ("everything", "everything", true),
+    ];
+    let sort_options = &["alphabetic", "latest", "items", "software"];
+    let mut software_options = Vec::with_capacity(sources.software_counts.len() + 1);
+    software_options.push(RespCollectionTargetSoftwareCount {
+        software: Cow::Borrowed("all"),
+        count: sources.scope_total_count,
+    });
+    software_options.extend(sources.software_counts.iter().map(|software_count| {
+        RespCollectionTargetSoftwareCount {
+            software: Cow::Borrowed(software_count.software.as_ref()),
+            count: software_count.count,
+        }
+    }));
+
+    Ok(html_response(render::html! {
+        <HTPage base_data={&base_data} lang={&lang} title>
+            <h1>{title}</h1>
+            <form method={"GET"} action={"/lookup"}>
+                <label>
+                    {"Add remote feed "}
+                    <input r#type={"text"} name={"query"} placeholder={"https://wedistribute.org/"} />
+                </label>
+                {" "}
+                <button r#type={"submit"}>{lang.tr(&lang::FETCH)}</button>
+            </form>
+            <div class={"communitiesControls"}>
+                <form class={"communitySearch"} method={"GET"} action={"/sources"}>
+                    <label>
+                        {"Search "}
+                        <input
+                            r#type={"text"}
+                            name={"search"}
+                            value={query.search.as_deref().unwrap_or("")}
+                            placeholder={"Search feeds"}
+                        />
+                    </label>
+                    <input r#type={"hidden"} name={"scope"} value={scope} />
+                    {
+                        if software == "all" {
+                            None
+                        } else {
+                            Some(render::rsx! {
+                                <input r#type={"hidden"} name={"software"} value={software} />
+                            })
+                        }
+                    }
+                    {
+                        if sort == "alphabetic" {
+                            None
+                        } else {
+                            Some(render::rsx! {
+                                <input r#type={"hidden"} name={"sort"} value={sort} />
+                            })
+                        }
+                    }
+                    {" "}
+                    <button r#type={"submit"}>{"Search"}</button>
+                </form>
+            </div>
+            <div class={"sortOptions"}>
+                {
+                    filter_options.iter()
+                        .filter(|(_, _, show)| *show)
+                        .map(|(option_scope, label, _)| {
+                            if scope == *option_scope {
+                                Ok::<_, crate::Error>(render::rsx! { <span>{*label}</span> })
+                            } else {
+                                let href = sources_url(
+                                    search_for_links,
+                                    option_scope,
+                                    None,
+                                    Some(software),
+                                    Some(sort),
+                                )?;
+
+                                Ok(render::rsx! { <a href={href}>{*label}</a> })
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+            </div>
+            <div class={"sortOptions communitySoftwareOptions"}>
+                {
+                    software_options.iter()
+                        .filter(|software_count| {
+                            software_count.count > 0 || software_count.software.as_ref() == "all"
+                        })
+                        .map(|software_count| {
+                            let option_software = software_count.software.as_ref();
+                            let label = format!(
+                                "{} ({})",
+                                source_software_label(option_software),
+                                software_count.count.max(0),
+                            );
+
+                            if software == option_software {
+                                Ok::<_, crate::Error>(render::rsx! { <span>{label}</span> })
+                            } else {
+                                let href = sources_url(
+                                    search_for_links,
+                                    scope,
+                                    None,
+                                    Some(option_software),
+                                    Some(sort),
+                                )?;
+
+                                Ok(render::rsx! { <a href={href}>{label}</a> })
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+            </div>
+            <div class={"sortOptions communitySortOptions"}>
+                {
+                    sort_options.iter()
+                        .map(|option_sort| {
+                            let label = source_sort_label(option_sort);
+
+                            if sort == *option_sort {
+                                Ok::<_, crate::Error>(render::rsx! { <span>{label}</span> })
+                            } else {
+                                let href = sources_url(
+                                    search_for_links,
+                                    scope,
+                                    None,
+                                    Some(software),
+                                    Some(option_sort),
+                                )?;
+
+                                Ok(render::rsx! { <a href={href}>{label}</a> })
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+            </div>
+            <p class={"communitiesCount"}>{sources_count_text}</p>
+            {
+                if sources.items.is_empty() {
+                    Some(render::rsx! {
+                        <p>{lang.tr(&lang::NOTHING_YET)}</p>
+                    })
+                } else {
+                    None
+                }
+            }
+            <ul class={"sourceList communityList"}>
+                {
+                    sources.items.iter()
+                        .map(|source| {
+                            let follow_status = source
+                                .your_follow
+                                .as_ref()
+                                .map_or(source.latest_unfollow_status, |follow| follow.federation_status);
+                            let action_class = format!(
+                                "sourceActions communityActions {}",
+                                federation_status_line_class(follow_status),
+                            );
+                            let preview_href = source
+                                .latest_preview_url
+                                .as_deref()
+                                .unwrap_or_else(|| source.remote_url.as_ref());
+                            let capability_labels = source_capability_labels(
+                                source.kind.as_ref(),
+                                source.software.as_ref(),
+                            );
+
+                            render::rsx! {
+                                <li>
+                                    <div>
+                                        <div class={"sourceNameLine communityNameLine"}>
+                                            <a href={format!("/collection_targets/{}", source.id)}>
+                                                {source.name.as_ref()}
+                                            </a>
+                                        </div>
+                                        <small class={"sourceMeta communityMeta"}>
+                                            <span class={"sourceBadge"}>{source_software_label(source.software.as_ref())}</span>
+                                            {" "}
+                                            <span class={"sourceBadge"}>{source_kind_label(source.kind.as_ref())}</span>
+                                            {" "}
+                                            <a href={safe_href(source.remote_url.as_ref()).unwrap_or("#")}>{lang.tr(&lang::VIEW_AT_SOURCE)}{" ->"}</a>
+                                        </small>
+                                        {
+                                            source.owner.remote_url.as_ref().map(|owner_url| {
+                                                render::rsx! {
+                                                    <small class={"sourceOwner"}>
+                                                        {"Owner "}
+                                                        <a href={safe_href(owner_url.as_ref()).unwrap_or("#")}>{owner_url.as_ref()}</a>
+                                                    </small>
+                                                }
+                                            })
+                                        }
+                                        <small class={"sourceStats"}>
+                                            {
+                                                match source.total_items {
+                                                    Some(1) => Cow::Borrowed("1 reported item"),
+                                                    Some(count) if count > 1 => Cow::Owned(format!("{count} reported items")),
+                                                    _ => Cow::Owned(format!("{} preview items cached", source.preview_item_count.max(0))),
+                                                }
+                                            }
+                                        </small>
+                                        {
+                                            source.summary_excerpt.as_ref().map(|summary| {
+                                                render::rsx! {
+                                                    <small class={"sourceSummary"}>{summary.as_ref()}</small>
+                                                }
+                                            })
+                                        }
+                                        {
+                                            source.latest_preview_item.as_ref().map(|latest| {
+                                                render::rsx! {
+                                                    <small class={"sourceLatest"}>
+                                                        {"Latest preview: "}
+                                                        <a href={safe_href(preview_href).unwrap_or("#")}>{latest.as_ref()}</a>
+                                                        {
+                                                            source.latest_preview_published.as_ref().map(|published| {
+                                                                render::rsx! {
+                                                                    <>
+                                                                        {" "}
+                                                                        <span class={"metaText"}>{published.as_ref()}</span>
+                                                                    </>
+                                                                }
+                                                            })
+                                                        }
+                                                    </small>
+                                                }
+                                            })
+                                        }
+                                        <div class={"sourceBadges"}>
+                                            {
+                                                capability_labels.iter()
+                                                    .map(|label| {
+                                                        render::rsx! { <span class={"sourceBadge"}>{*label}</span> }
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            }
+                                        </div>
+                                    </div>
+                                    {
+                                        if base_data.login.is_some() {
+                                            let (action, label) = match &source.your_follow {
+                                                Some(follow) => (
+                                                    format!("/collection_targets/{}/unfollow", source.id),
+                                                    if follow.accepted { "Unfollow" } else { "Cancel follow" },
+                                                ),
+                                                None => (
+                                                    format!("/collection_targets/{}/follow", source.id),
+                                                    "Follow",
+                                                ),
+                                            };
+
+                                            Some(render::rsx! {
+                                                <div class={action_class}>
+                                                    <form method={"POST"} action={action}>
+                                                        <button r#type={"submit"}>{label}</button>
+                                                    </form>
+                                                    <FollowFederationStatusBadge
+                                                        your_follow={source.your_follow.as_ref()}
+                                                        latest_unfollow_status={source.latest_unfollow_status}
+                                                    />
+                                                </div>
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                </li>
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                }
+            </ul>
+            {
+                render_sources_pagination(
+                    search_for_links,
+                    scope,
+                    current_page,
+                    sources.next_page.is_some(),
+                    Some(software),
+                    Some(sort),
+                )?
+            }
+        </HTPage>
+    }))
+}
+
 async fn page_collection_target(
     params: (i64,),
     ctx: Arc<crate::RouteContext>,
@@ -681,6 +1353,14 @@ async fn page_collection_target(
     let collection: RespCollectionTargetInfo = serde_json::from_slice(&api_res)?;
 
     let title = collection.name.as_ref();
+    let collection_software = collection
+        .software
+        .as_deref()
+        .unwrap_or_else(|| collection.kind.as_ref());
+    let collection_software_label =
+        source_software_label(normalize_source_software(Some(collection_software)));
+    let collection_kind_label = source_kind_label(collection.kind.as_ref());
+    let capability_labels = source_capability_labels(collection.kind.as_ref(), collection_software);
     let follow_status = collection
         .your_follow
         .as_ref()
@@ -691,17 +1371,22 @@ async fn page_collection_target(
         "followAction {}",
         federation_status_line_class(follow_status),
     );
+    let preview_item_likes_supported = collection.preview_item_likes_supported;
     let preview_rows = collection
         .preview_items
         .iter()
         .map(|item| {
-            let href = item
-                .url
-                .as_ref()
-                .map_or_else(|| item.ap_id.as_ref(), std::convert::AsRef::as_ref);
+            let href = format!("/collection_targets/{collection_target_id}/items/{}", item.id);
+            let vote_status = item.your_vote.as_ref().and_then(|vote| vote.federation_status);
+            let vote_class = format!(
+                "sourceItemVote voteAction {}",
+                federation_status_line_class(vote_status),
+            );
             render::rsx! {
                 <li>
-                    <a href={safe_href(href).unwrap_or("#")}>{item.name.as_ref()}</a>
+                    <span class={"sourcePreviewTitle"}>
+                        <a href={href}>{item.name.as_ref()}</a>
+                    </span>
                     {
                         item.kind.as_ref().map(|kind| {
                             render::rsx! {
@@ -722,29 +1407,72 @@ async fn page_collection_target(
                             }
                         })
                     }
+                    {
+                        if base_data.login.is_some() {
+                            Some(render::rsx! {
+                                <span class={vote_class}>
+                                    {
+                                        if item.your_vote.is_some() {
+                                            render::rsx! {
+                                                <form method={"POST"} action={format!("/collection_targets/{}/items/{}/unlike", collection_target_id, item.id)}>
+                                                    <button class={"iconbutton"} type={"submit"}>{hitide_icons::UPVOTED.img(lang.tr(&lang::remove_upvote()).into_owned())}</button>
+                                                </form>
+                                            }
+                                        } else if !preview_item_likes_supported {
+                                            render::rsx! {
+                                                <form method={"POST"} action={"#"}>
+                                                    <button class={"iconbutton"} type={"submit"} disabled={"disabled"}>{hitide_icons::UPVOTE.img("likes unavailable".to_owned())}</button>
+                                                </form>
+                                            }
+                                        } else {
+                                            render::rsx! {
+                                                <form method={"POST"} action={format!("/collection_targets/{}/items/{}/like", collection_target_id, item.id)}>
+                                                    <button class={"iconbutton"} type={"submit"}>{hitide_icons::UPVOTE.img(lang.tr(&lang::upvote()).into_owned())}</button>
+                                                </form>
+                                            }
+                                        }
+                                    }
+                                    <FederationStatusBadge status={vote_status} />
+                                </span>
+                            })
+                        } else {
+                            None
+                        }
+                    }
                 </li>
             }
         })
         .collect::<Vec<_>>();
-    let preview_section = if preview_rows.is_empty() {
-        None
-    } else {
-        Some(render::rsx! {
-            <section>
-                <h2>{"Preview"}</h2>
-                <ul class={"collectionPreviewList"}>{preview_rows}</ul>
-            </section>
+    let preview_message = if preview_rows.is_empty() {
+        Some(match collection.total_items {
+            Some(count) if count > 0 => {
+                format!("This feed reports {count} items, but no preview items are available yet.")
+            }
+            _ => "No preview items are available yet.".to_owned(),
         })
+    } else {
+        None
     };
 
     Ok(html_response(render::html! {
         <HTPage base_data={&base_data} lang={&lang} title>
             <h1>{title}</h1>
             <p>
-                <em>{collection.software.as_deref().unwrap_or_else(|| collection.kind.as_ref())}</em>
+                <span class={"sourceBadge"}>{collection_software_label}</span>
                 {" "}
-                <a href={safe_href(collection.remote_url.as_ref()).unwrap_or("#")}>{lang.tr(&lang::VIEW_AT_SOURCE)}{" â†—"}</a>
+                <span class={"sourceBadge"}>{collection_kind_label}</span>
+                {" "}
+                <a href={safe_href(collection.remote_url.as_ref()).unwrap_or("#")}>{lang.tr(&lang::VIEW_AT_SOURCE)}{" ->"}</a>
             </p>
+            <div class={"sourceBadges"}>
+                {
+                    capability_labels.iter()
+                        .map(|label| {
+                            render::rsx! { <span class={"sourceBadge"}>{*label}</span> }
+                        })
+                        .collect::<Vec<_>>()
+                }
+            </div>
             {
                 collection.total_items.map(|total_items| {
                     render::rsx! {
@@ -755,11 +1483,23 @@ async fn page_collection_target(
             {
                 collection.summary_html.as_ref().map(|summary| {
                     render::rsx! {
-                        <div class={"infoBox"}>{summary.as_ref()}</div>
+                        <div class={"infoBox"}>
+                            <div class={"contentView"}>{render::raw!(summary.as_ref())}</div>
+                        </div>
                     }
                 })
             }
-            {preview_section}
+            <section>
+                <h2>{"Preview"}</h2>
+                {
+                    preview_message.as_ref().map(|message| {
+                        render::rsx! {
+                            <div class={"infoBox"}>{message.as_ref()}</div>
+                        }
+                    })
+                }
+                <ul class={"collectionPreviewList"}>{preview_rows}</ul>
+            </section>
             {
                 if base_data.login.is_some() {
                     Some(render::rsx! {
@@ -799,6 +1539,237 @@ async fn page_collection_target(
                     None
                 }
             }
+        </HTPage>
+    }))
+}
+
+async fn page_collection_target_item(
+    params: (i64, i64),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (collection_target_id, item_id) = params;
+    let lang = crate::get_lang_for_req(&req);
+    let cookies = get_cookie_map_for_req(&req)?;
+    let base_data =
+        fetch_base_data(&ctx.backend_host, &ctx.http_client, req.headers(), &cookies).await?;
+
+    let api_res = res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::get(format!(
+                    "{}/api/unstable/collection_targets/{}/items/{}",
+                    ctx.backend_host, collection_target_id, item_id,
+                ))
+                .body(hyper::Body::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
+    let source_item: RespCollectionTargetItemInfo = serde_json::from_slice(&api_res)?;
+
+    let item = &source_item.item;
+    let collection = &source_item.collection;
+    let title = item.name.as_ref();
+    let source_href = item
+        .url
+        .as_ref()
+        .map_or_else(|| item.ap_id.as_ref(), std::convert::AsRef::as_ref);
+    let collection_software = collection
+        .software
+        .as_deref()
+        .unwrap_or_else(|| collection.kind.as_ref());
+    let vote_status = item
+        .your_vote
+        .as_ref()
+        .and_then(|vote| vote.federation_status);
+    let vote_class = format!(
+        "sourceItemVote voteAction {}",
+        federation_status_line_class(vote_status),
+    );
+    let has_cached_body = item.content_html.is_some() || item.summary_html.is_some();
+    let comment_rows = source_item
+        .comments
+        .iter()
+        .map(|comment| {
+            let comment_status = comment.federation_status;
+            let comment_class = format!(
+                "sourceItemComment {}",
+                federation_status_line_class(comment_status),
+            );
+
+            render::rsx! {
+                <li class={comment_class}>
+                    <div class={"sourceItemCommentMeta"}>
+                        <cite><UserLink lang={&lang} user={comment.author.as_ref()} /></cite>
+                        {" "}
+                        <SafeTimeAgo since={comment.created.as_ref()} lang={&lang} />
+                        {" "}
+                        <FederationStatusBadge status={comment_status} />
+                    </div>
+                    <ContentView src={comment} />
+                </li>
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(html_response(render::html! {
+        <HTPage base_data={&base_data} lang={&lang} title>
+            <p class={"sourceItemParent"}>
+                <a href={format!("/collection_targets/{collection_target_id}")}>{collection.name.as_ref()}</a>
+                {" "}
+                <span class={"sourceBadge"}>{source_software_label(normalize_source_software(Some(collection_software)))}</span>
+                {" "}
+                <span class={"sourceBadge"}>{source_kind_label(collection.kind.as_ref())}</span>
+            </p>
+            <h1>{title}</h1>
+            <p class={"sourceItemMeta"}>
+                {
+                    item.kind.as_ref().map(|kind| {
+                        render::rsx! {
+                            <span class={"metaText"}>{kind.as_ref()}</span>
+                        }
+                    })
+                }
+                {
+                    item.published.as_ref().map(|published| {
+                        render::rsx! {
+                            <>
+                                {" "}
+                                <span class={"metaText"}>{published.as_ref()}</span>
+                            </>
+                        }
+                    })
+                }
+                {" "}
+                <a href={safe_href(source_href).unwrap_or("#")}>{lang.tr(&lang::VIEW_AT_SOURCE)}{" ->"}</a>
+            </p>
+            {
+                item.image_url.as_ref().and_then(|image_url| {
+                    safe_href(image_url.as_ref()).map(|href| {
+                        render::rsx! {
+                            <p class={"sourceItemImage"}>
+                                <a href={href}>
+                                    <img src={href} alt={title} loading={"lazy"} />
+                                </a>
+                            </p>
+                        }
+                    })
+                })
+            }
+            <div class={"postContent sourceItemContent"}>
+                {
+                    item.content_html.as_ref().map(|content| {
+                        render::rsx! {
+                            <div class={"contentView"}>{render::raw!(content.as_ref())}</div>
+                        }
+                    })
+                }
+                {
+                    if item.content_html.is_none() {
+                        item.summary_html.as_ref().map(|summary| {
+                            render::rsx! {
+                                <div class={"contentView"}>{render::raw!(summary.as_ref())}</div>
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                }
+                {
+                    if has_cached_body {
+                        None
+                    } else {
+                        Some(render::rsx! {
+                            <p class={"metaText"}>{"No cached body is available for this feed item yet."}</p>
+                        })
+                    }
+                }
+            </div>
+            {
+                if base_data.login.is_some() {
+                    Some(render::rsx! {
+                        <p class={vote_class}>
+                            {
+                                if item.your_vote.is_some() {
+                                    render::rsx! {
+                                        <form method={"POST"} action={format!("/collection_targets/{}/items/{}/unlike", collection_target_id, item_id)}>
+                                            <button class={"iconbutton"} type={"submit"}>{hitide_icons::UPVOTED.img(lang.tr(&lang::remove_upvote()).into_owned())}</button>
+                                        </form>
+                                    }
+                                } else if !collection.preview_item_likes_supported {
+                                    render::rsx! {
+                                        <form method={"POST"} action={"#"}>
+                                            <button class={"iconbutton"} type={"submit"} disabled={"disabled"}>{hitide_icons::UPVOTE.img("likes unavailable".to_owned())}</button>
+                                        </form>
+                                    }
+                                } else {
+                                    render::rsx! {
+                                        <form method={"POST"} action={format!("/collection_targets/{}/items/{}/like", collection_target_id, item_id)}>
+                                            <button class={"iconbutton"} type={"submit"}>{hitide_icons::UPVOTE.img(lang.tr(&lang::upvote()).into_owned())}</button>
+                                        </form>
+                                    }
+                                }
+                            }
+                            <FederationStatusBadge status={vote_status} />
+                        </p>
+                    })
+                } else {
+                    None
+                }
+            }
+            <section class={"sourceItemComments"}>
+                <h2>{"Comments"}</h2>
+                {
+                    if comment_rows.is_empty() {
+                        Some(render::rsx! {
+                            <p class={"metaText"}>{"No comments are cached for this feed item yet."}</p>
+                        })
+                    } else {
+                        None
+                    }
+                }
+                <ol>{comment_rows}</ol>
+                {
+                    if base_data.login.is_some() && collection.can_reply {
+                        Some(render::rsx! {
+                            <form class={"sourceItemCommentForm"} method={"POST"} action={format!("/collection_targets/{}/items/{}/comments", collection_target_id, item_id)}>
+                                <textarea name={"content_markdown"} required={"required"}></textarea>
+                                <button type={"submit"}>{"Send comment"}</button>
+                            </form>
+                        })
+                    } else {
+                        None
+                    }
+                }
+                {
+                    if base_data.login.is_some()
+                        && !collection.can_reply
+                        && !collection.preview_item_replies_supported
+                    {
+                        Some(render::rsx! {
+                            <p class={"metaText"}>{"This feed type does not expose a compatible reply path."}</p>
+                        })
+                    } else {
+                        None
+                    }
+                }
+                {
+                    if base_data.login.is_some()
+                        && !collection.can_reply
+                        && collection.preview_item_replies_supported
+                    {
+                        Some(render::rsx! {
+                            <p class={"metaText"}>{"The feed owner inbox is not known yet, so replies are disabled for now."}</p>
+                        })
+                    } else {
+                        None
+                    }
+                }
+            </section>
         </HTPage>
     }))
 }
@@ -869,6 +1840,142 @@ async fn handler_collection_target_unfollow(
                 format!("/collection_targets/{collection_target_id}"),
             )
             .body("Successfully unfollowed".into())?,
+    ))
+}
+
+fn collection_target_item_action_location(
+    req: &hyper::Request<hyper::Body>,
+    collection_target_id: i64,
+    item_id: i64,
+) -> String {
+    let collection_path = format!("/collection_targets/{collection_target_id}");
+    let item_path = format!("{collection_path}/items/{item_id}");
+    let Some(referer) = req
+        .headers()
+        .get(hyper::header::REFERER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return collection_path;
+    };
+
+    let path_and_query = if referer.starts_with('/') && !referer.starts_with("//") {
+        referer.to_owned()
+    } else if let Ok(url) = url::Url::parse(referer) {
+        let start = url::Position::BeforePath;
+        let end = url::Position::AfterQuery;
+        url[start..end].to_owned()
+    } else {
+        return collection_path;
+    };
+
+    if path_and_query == collection_path
+        || path_and_query.starts_with(&format!("{collection_path}?"))
+    {
+        collection_path
+    } else if path_and_query == item_path || path_and_query.starts_with(&format!("{item_path}?")) {
+        item_path
+    } else {
+        collection_path
+    }
+}
+
+async fn handler_collection_target_item_like(
+    params: (i64, i64),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (collection_target_id, item_id) = params;
+    let cookies = get_cookie_map_for_req(&req)?;
+    let location = collection_target_item_action_location(&req, collection_target_id, item_id);
+
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::put(format!(
+                    "{}/api/unstable/collection_targets/{}/items/{}/your_vote",
+                    ctx.backend_host, collection_target_id, item_id,
+                ))
+                .body(hyper::Body::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+
+    Ok(cache_invalidating_response(
+        hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, location)
+            .body("Successfully liked".into())?,
+    ))
+}
+
+async fn handler_collection_target_item_unlike(
+    params: (i64, i64),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (collection_target_id, item_id) = params;
+    let cookies = get_cookie_map_for_req(&req)?;
+    let location = collection_target_item_action_location(&req, collection_target_id, item_id);
+
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::delete(format!(
+                    "{}/api/unstable/collection_targets/{}/items/{}/your_vote",
+                    ctx.backend_host, collection_target_id, item_id,
+                ))
+                .body(hyper::Body::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+
+    Ok(cache_invalidating_response(
+        hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, location)
+            .body("Successfully unliked".into())?,
+    ))
+}
+
+async fn handler_collection_target_item_comment(
+    params: (i64, i64),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (collection_target_id, item_id) = params;
+    let (req_parts, body) = req.into_parts();
+    let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
+    let location = format!("/collection_targets/{collection_target_id}/items/{item_id}");
+    let body = crate::read_body_with_timeout(body).await?;
+    let body: serde_json::Value = serde_urlencoded::from_bytes(&body)?;
+
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::post(format!(
+                    "{}/api/unstable/collection_targets/{}/items/{}/comments",
+                    ctx.backend_host, collection_target_id, item_id,
+                ))
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(serde_json::to_vec(&body)?.into())?,
+                &req_parts.headers,
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+
+    Ok(cache_invalidating_response(
+        hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, location)
+            .body("Successfully commented".into())?,
     ))
 }
 
@@ -1237,6 +2344,284 @@ async fn page_notifications(
     }
 }
 
+fn private_message_partner<'a>(
+    message: &'a RespPrivateMessageInfo<'a>,
+    login_user_id: i64,
+) -> &'a crate::resp_types::RespMinimalAuthorInfo<'a> {
+    if message.author.id == login_user_id {
+        &message.recipient
+    } else {
+        &message.author
+    }
+}
+
+async fn page_messages(
+    (): (),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let lang = crate::get_lang_for_req(&req);
+    let cookies = get_cookie_map_for_req(&req)?;
+    let base_data =
+        fetch_base_data(&ctx.backend_host, &ctx.http_client, req.headers(), &cookies).await?;
+
+    let Some(login) = &base_data.login else {
+        return Ok(hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, "/login")
+            .body("Login required.".into())?);
+    };
+
+    let api_res = res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::get(format!(
+                    "{}/api/unstable/users/~me/messages?conversations=true",
+                    ctx.backend_host
+                ))
+                .body(hyper::Body::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
+    let messages: RespList<RespPrivateMessageInfo> = serde_json::from_slice(&api_res)?;
+    let title = "Messages";
+
+    Ok(html_response(render::html! {
+        <HTPage base_data={&base_data} lang={&lang} title>
+            <h1>{title}</h1>
+            {
+                if messages.items.is_empty() {
+                    Some(render::rsx! { <p>{lang.tr(&lang::NOTHING)}</p> })
+                } else {
+                    None
+                }
+            }
+            <ul class={"messageList"}>
+                {
+                    messages.items.iter().map(|message| {
+                        let partner = private_message_partner(message, login.user.id);
+                        let status_class = federation_status_line_class(message.federation_status);
+                        let direction = if message.author.id == login.user.id {
+                            Some("You: ")
+                        } else {
+                            None
+                        };
+
+                        render::rsx! {
+                            <li class={format!("messageItem {}", status_class)}>
+                                <div>
+                                    <UserLink lang={&lang} user={Some(partner)} />
+                                    {" "}
+                                    <small><SafeTimeAgo since={message.created.as_ref()} lang={&lang} /></small>
+                                    <FederationStatusBadge status={message.federation_status} />
+                                </div>
+                                <div class={"messageActions"}>
+                                    <a href={format!("/messages/users/{}", partner.id)}>{"open conversation"}</a>
+                                    <form class={"inline"} method={"POST"} action={format!("/messages/users/{}/dismiss", partner.id)}>
+                                        <button type={"submit"}>{"Dismiss"}</button>
+                                    </form>
+                                </div>
+                                {direction}
+                                <ContentView src={message} />
+                            </li>
+                        }
+                    }).collect::<Vec<_>>()
+                }
+            </ul>
+        </HTPage>
+    }))
+}
+
+async fn page_message_thread(
+    params: (i64,),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (user_id,) = params;
+    let lang = crate::get_lang_for_req(&req);
+    let cookies = get_cookie_map_for_req(&req)?;
+    let base_data =
+        fetch_base_data(&ctx.backend_host, &ctx.http_client, req.headers(), &cookies).await?;
+
+    if base_data.login.is_none() {
+        return Ok(hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, "/login")
+            .body("Login required.".into())?);
+    }
+
+    let user = res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::get(format!(
+                    "{}/api/unstable/users/{}?include_your=true",
+                    ctx.backend_host, user_id,
+                ))
+                .body(hyper::Body::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+    let user = crate::read_body_with_timeout(user.into_body()).await?;
+    let user: RespUserInfo<'_> = serde_json::from_slice(&user)?;
+
+    let api_res = res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::get(format!(
+                    "{}/api/unstable/users/~me/messages?with_user={}",
+                    ctx.backend_host, user_id
+                ))
+                .body(hyper::Body::default())?,
+                req.headers(),
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+    let api_res = crate::read_body_with_timeout(api_res.into_body()).await?;
+    let messages: RespList<RespPrivateMessageInfo> = serde_json::from_slice(&api_res)?;
+    let latest_message = messages.items.first().map(|message| message.id);
+    let title = format!("Messages with {}", user.as_ref().username);
+
+    Ok(html_response(render::html! {
+        <HTPage base_data={&base_data} lang={&lang} title={&title}>
+            <h1>{title.as_str()}</h1>
+            <div class={"actionList"}>
+                <a href={"/messages"}>{"All messages"}</a>
+                <a href={format!("/users/{}", user_id)}>{"View profile"}</a>
+                <form class={"inline"} method={"POST"} action={format!("/messages/users/{}/dismiss", user_id)}>
+                    <button type={"submit"}>{"Dismiss conversation"}</button>
+                </form>
+            </div>
+            <ol class={"messageThread"}>
+                {
+                    messages.items.iter().rev().map(|message| {
+                        let status_class = federation_status_line_class(message.federation_status);
+
+                        render::rsx! {
+                            <li class={format!("messageItem {}", status_class)} id={format!("message{}", message.id)}>
+                                <div>
+                                    <UserLink lang={&lang} user={Some(&message.author)} />
+                                    {" "}
+                                    <small><SafeTimeAgo since={message.created.as_ref()} lang={&lang} /></small>
+                                    <FederationStatusBadge status={message.federation_status} />
+                                </div>
+                                <ContentView src={message} />
+                            </li>
+                        }
+                    }).collect::<Vec<_>>()
+                }
+            </ol>
+            <form method={"POST"} action={format!("/messages/users/{}/submit", user_id)}>
+                {
+                    latest_message.map(|message_id| {
+                        render::rsx! {
+                            <input type={"hidden"} name={"in_reply_to"} value={message_id.to_string()} />
+                        }
+                    })
+                }
+                <div>
+                    <textarea name={"content_text"} autofocus={""}>{""}</textarea>
+                </div>
+                <button type={"submit"}>{"Send message"}</button>
+            </form>
+        </HTPage>
+    }))
+}
+
+async fn handler_message_submit(
+    params: (i64,),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (user_id,) = params;
+    let (req_parts, body) = req.into_parts();
+    let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
+    let body = crate::read_body_with_timeout(body).await?;
+    let mut body: serde_json::map::Map<String, serde_json::Value> =
+        serde_urlencoded::from_bytes(&body)?;
+
+    body.insert("recipient".to_owned(), serde_json::json!(user_id));
+
+    if let Some(in_reply_to) = body.get("in_reply_to").and_then(|value| value.as_str()) {
+        if in_reply_to.is_empty() {
+            body.remove("in_reply_to");
+        } else {
+            let in_reply_to: i64 = in_reply_to.parse().map_err(|_| {
+                crate::Error::UserError(crate::simple_response(
+                    hyper::StatusCode::BAD_REQUEST,
+                    "Invalid private message parent.",
+                ))
+            })?;
+            body.insert("in_reply_to".to_owned(), serde_json::json!(in_reply_to));
+        }
+    }
+
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::post(format!(
+                    "{}/api/unstable/users/~me/messages",
+                    ctx.backend_host
+                ))
+                .body(serde_json::to_vec(&body)?.into())?,
+                &req_parts.headers,
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+
+    Ok(cache_invalidating_response(
+        hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(
+                hyper::header::LOCATION,
+                format!("/messages/users/{user_id}"),
+            )
+            .body("Message sent.".into())?,
+    ))
+}
+
+async fn handler_message_dismiss(
+    params: (i64,),
+    ctx: Arc<crate::RouteContext>,
+    req: hyper::Request<hyper::Body>,
+) -> Result<hyper::Response<hyper::Body>, crate::Error> {
+    let (user_id,) = params;
+    let (req_parts, _) = req.into_parts();
+    let cookies = get_cookie_map_for_headers(&req_parts.headers)?;
+
+    res_to_error(
+        ctx.http_client
+            .request(for_client(
+                hyper::Request::post(format!(
+                    "{}/api/unstable/users/~me/messages:dismiss",
+                    ctx.backend_host
+                ))
+                .body(serde_json::to_vec(&serde_json::json!({ "with_user": user_id }))?.into())?,
+                &req_parts.headers,
+                &cookies,
+            )?)
+            .await?,
+    )
+    .await?;
+
+    Ok(cache_invalidating_response(
+        hyper::Response::builder()
+            .status(hyper::StatusCode::SEE_OTHER)
+            .header(hyper::header::LOCATION, "/messages")
+            .body("Conversation dismissed.".into())?,
+    ))
+}
+
 async fn page_signup(
     (): (),
     ctx: Arc<crate::RouteContext>,
@@ -1515,6 +2900,15 @@ async fn page_user(
                             render::rsx! {
                                 <p class={"actionList small"}>
                                     <a href={format!("/users/{}/edit", user_id)}>{"Edit profile and avatar"}</a>
+                                </p>
+                            }
+                        })
+                    }
+                    {
+                        (!is_me && base_data.login.is_some()).then(|| {
+                            render::rsx! {
+                                <p class={"actionList small"}>
+                                    <a href={format!("/messages/users/{}", user_id)}>{"Message"}</a>
                                 </p>
                             }
                         })
@@ -2461,6 +3855,34 @@ pub fn route_root() -> crate::RouteNode<()> {
                 crate::RouteNode::new()
                     .with_handler_async(hyper::Method::GET, page_collection_target)
                     .with_child(
+                        "items",
+                        crate::RouteNode::new().with_child_parse::<i64, _>(
+                            crate::RouteNode::new()
+                                .with_handler_async(hyper::Method::GET, page_collection_target_item)
+                                .with_child(
+                                    "like",
+                                    crate::RouteNode::new().with_handler_async(
+                                        hyper::Method::POST,
+                                        handler_collection_target_item_like,
+                                    ),
+                                )
+                                .with_child(
+                                    "unlike",
+                                    crate::RouteNode::new().with_handler_async(
+                                        hyper::Method::POST,
+                                        handler_collection_target_item_unlike,
+                                    ),
+                                )
+                                .with_child(
+                                    "comments",
+                                    crate::RouteNode::new().with_handler_async(
+                                        hyper::Method::POST,
+                                        handler_collection_target_item_comment,
+                                    ),
+                                ),
+                        ),
+                    )
+                    .with_child(
                         "follow",
                         crate::RouteNode::new().with_handler_async(
                             hyper::Method::POST,
@@ -2508,6 +3930,36 @@ pub fn route_root() -> crate::RouteNode<()> {
         .with_child(
             "modlog",
             crate::RouteNode::new().with_handler_async(hyper::Method::GET, page_modlog),
+        )
+        .with_child(
+            "messages",
+            crate::RouteNode::new()
+                .with_handler_async(hyper::Method::GET, page_messages)
+                .with_child(
+                    "users",
+                    crate::RouteNode::new().with_child_parse::<i64, _>(
+                        crate::RouteNode::new()
+                            .with_handler_async(hyper::Method::GET, page_message_thread)
+                            .with_child(
+                                "submit",
+                                crate::RouteNode::new().with_handler_async(
+                                    hyper::Method::POST,
+                                    handler_message_submit,
+                                ),
+                            )
+                            .with_child(
+                                "dismiss",
+                                crate::RouteNode::new().with_handler_async(
+                                    hyper::Method::POST,
+                                    handler_message_dismiss,
+                                ),
+                            ),
+                    ),
+                ),
+        )
+        .with_child(
+            "sources",
+            crate::RouteNode::new().with_handler_async(hyper::Method::GET, page_sources),
         )
         .with_child(
             "my_invitations",
@@ -2636,6 +4088,87 @@ mod tests {
     }
 
     #[test]
+    fn sources_url_preserves_active_filters_and_omits_defaults() {
+        assert_eq!(
+            super::sources_url(
+                Some("wedistribute"),
+                "everything",
+                Some(2),
+                Some("wordpress"),
+                Some("latest")
+            )
+            .unwrap(),
+            "/sources?search=wedistribute&scope=everything&page=2&software=wordpress&sort=latest"
+        );
+
+        assert_eq!(
+            super::sources_url(None, "mine", None, Some("all"), Some("alphabetic")).unwrap(),
+            "/sources?scope=mine"
+        );
+    }
+
+    #[test]
+    fn source_software_filter_names_match_backend_keys() {
+        assert_eq!(
+            super::normalize_source_software(Some("funkwhale_library")),
+            "funkwhale"
+        );
+        assert_eq!(
+            super::normalize_source_software(Some("castopod")),
+            "castopod"
+        );
+        assert_eq!(
+            super::source_software_label("castopod").as_ref(),
+            "Castopod"
+        );
+    }
+
+    #[test]
+    fn source_capabilities_explain_non_group_shapes() {
+        assert_eq!(
+            super::source_capability_labels("funkwhale_library", "funkwhale"),
+            vec!["follow library", "preview tracks", "owner inbox"]
+        );
+        assert_eq!(
+            super::source_capability_labels("collection", "wordpress"),
+            vec!["follow author", "read posts", "send replies"]
+        );
+        assert_eq!(
+            super::source_capability_labels("actor_feed", "owncast"),
+            vec!["follow stream", "live notices", "read posts"]
+        );
+        assert_eq!(
+            super::source_capability_labels("actor_feed", "castopod"),
+            vec!["follow podcast", "preview episodes", "send replies"]
+        );
+        assert_eq!(
+            super::source_capability_labels("actor_feed", "pixelfed"),
+            vec!["follow account", "preview images", "send replies"]
+        );
+        assert_eq!(
+            super::source_capability_labels("Group", "unknown"),
+            vec!["follow group", "read posts"]
+        );
+    }
+
+    #[test]
+    fn sources_count_text_matches_scope_and_search() {
+        assert_eq!(
+            super::sources_count_text("mine", 1, false),
+            "1 followed feed"
+        );
+        assert_eq!(
+            super::sources_count_text("mine", 2, true),
+            "2 matching followed feeds"
+        );
+        assert_eq!(super::sources_count_text("everything", 1, false), "1 feed");
+        assert_eq!(
+            super::sources_count_text("everything", -4, false),
+            "0 feeds"
+        );
+    }
+
+    #[test]
     fn cache_invalidating_response_sets_browser_and_proxy_headers() {
         let res = super::cache_invalidating_response(hyper::Response::new(hyper::Body::empty()));
 
@@ -2647,6 +4180,21 @@ mod tests {
         assert_eq!(res.headers()[hyper::header::EXPIRES], "0");
         assert_eq!(res.headers()["Clear-Site-Data"], "\"cache\"");
         assert_eq!(res.headers()["Surrogate-Control"], "no-store");
+    }
+
+    #[test]
+    fn html_response_marks_dynamic_pages_private_without_clearing_site_data() {
+        let res = super::html_response("body".to_owned());
+
+        assert_eq!(res.headers()[hyper::header::CONTENT_TYPE], "text/html");
+        assert_eq!(
+            res.headers()[hyper::header::CACHE_CONTROL],
+            "no-store, no-cache, must-revalidate, max-age=0, private"
+        );
+        assert_eq!(res.headers()[hyper::header::PRAGMA], "no-cache");
+        assert_eq!(res.headers()[hyper::header::EXPIRES], "0");
+        assert_eq!(res.headers()["Surrogate-Control"], "no-store");
+        assert!(!res.headers().contains_key("Clear-Site-Data"));
     }
 
     #[test]
@@ -2665,6 +4213,45 @@ mod tests {
     }
 
     #[test]
+    fn collection_target_item_actions_return_to_safe_local_source_pages() {
+        let req = hyper::Request::builder()
+            .header(
+                hyper::header::REFERER,
+                "https://lotide.example/collection_targets/12/items/44",
+            )
+            .body(hyper::Body::empty())
+            .unwrap();
+
+        assert_eq!(
+            super::collection_target_item_action_location(&req, 12, 44),
+            "/collection_targets/12/items/44"
+        );
+
+        let req = hyper::Request::builder()
+            .header(
+                hyper::header::REFERER,
+                "https://evil.example/collection_targets/12/items/44?x=1",
+            )
+            .body(hyper::Body::empty())
+            .unwrap();
+
+        assert_eq!(
+            super::collection_target_item_action_location(&req, 12, 44),
+            "/collection_targets/12/items/44"
+        );
+
+        let req = hyper::Request::builder()
+            .header(hyper::header::REFERER, "https://evil.example/elsewhere")
+            .body(hyper::Body::empty())
+            .unwrap();
+
+        assert_eq!(
+            super::collection_target_item_action_location(&req, 12, 44),
+            "/collection_targets/12"
+        );
+    }
+
+    #[test]
     fn cookie_parser_keeps_valid_cookies_when_a_fragment_is_malformed() {
         let cookies = super::get_cookie_map(Some("badfragment; hitideToken=abc123; empty=;"))
             .expect("malformed cookie fragments should be ignored");
@@ -2672,5 +4259,85 @@ mod tests {
         assert_eq!(cookies.get("hitideToken").unwrap().value, "abc123");
         assert_eq!(cookies.get("empty").unwrap().value, "");
         assert!(!cookies.contains_key("badfragment"));
+    }
+
+    #[test]
+    fn private_message_partner_returns_the_other_participant() {
+        fn user(
+            id: i64,
+            username: &'static str,
+        ) -> crate::resp_types::RespMinimalAuthorInfo<'static> {
+            crate::resp_types::RespMinimalAuthorInfo {
+                id,
+                username: std::borrow::Cow::Borrowed(username),
+                local: true,
+                host: std::borrow::Cow::Borrowed("example.test"),
+                remote_url: None,
+                avatar: None,
+                is_bot: false,
+            }
+        }
+
+        let sent = crate::resp_types::RespPrivateMessageInfo {
+            id: 10,
+            author: user(1, "me"),
+            recipient: user(2, "remote"),
+            created: std::borrow::Cow::Borrowed("2026-06-18T00:00:00Z"),
+            local: true,
+            remote_url: None,
+            content_text: Some(std::borrow::Cow::Borrowed("hello")),
+            content_markdown: None,
+            content_html: None,
+            in_reply_to: None,
+            federation_status: None,
+            sensitive: false,
+        };
+
+        assert_eq!(super::private_message_partner(&sent, 1).id, 2);
+        assert_eq!(super::private_message_partner(&sent, 2).id, 1);
+    }
+
+    #[test]
+    fn private_message_form_closes_empty_textarea_before_submit_button() {
+        let html = render::html! {
+            <form method={"POST"} action={"/messages/users/2/submit"}>
+                <div>
+                    <textarea name={"content_text"} autofocus={""}>{""}</textarea>
+                </div>
+                <button type={"submit"}>{"Send message"}</button>
+            </form>
+        };
+
+        assert!(
+            html.contains("</textarea></div><button"),
+            "message form must not let the submit button become textarea text: {html}"
+        );
+    }
+
+    #[test]
+    fn private_message_dismiss_form_posts_to_conversation_route() {
+        let html = render::html! {
+            <form class={"inline"} method={"POST"} action={"/messages/users/2/dismiss"}>
+                <button type={"submit"}>{"Dismiss"}</button>
+            </form>
+        };
+
+        assert!(html.contains("method=\"POST\""));
+        assert!(html.contains("action=\"/messages/users/2/dismiss\""));
+        assert!(html.contains(">Dismiss</button>"));
+    }
+
+    #[test]
+    fn private_message_rows_render_visible_federation_status() {
+        let html = render::html! {
+            <div>
+                <crate::components::FederationStatusBadge
+                    status={Some(crate::resp_types::RespFederationStatus::Sent)}
+                />
+            </div>
+        };
+
+        assert!(html.contains("federationStatusSent"));
+        assert!(html.contains("federation: sent"));
     }
 }
